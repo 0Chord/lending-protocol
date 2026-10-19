@@ -1,8 +1,9 @@
 # Lending Protocol 학습 프로젝트
 
 Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학습 프로젝트다.
-현재 구현 범위는 [이슈 #1](https://github.com/0Chord/lending-protocol/issues/1)의 테스트 환경과 MockUSDC다.
-공급과 예치 기록은 [#2](https://github.com/0Chord/lending-protocol/issues/2), 출금은 [#3](https://github.com/0Chord/lending-protocol/issues/3)에서 이어간다.
+현재 구현 범위는 [이슈 #1](https://github.com/0Chord/lending-protocol/issues/1)의 테스트 환경·MockUSDC와
+[#2](https://github.com/0Chord/lending-protocol/issues/2)의 본인 공급·예치 기록이다.
+출금은 [#3](https://github.com/0Chord/lending-protocol/issues/3)에서 이어간다. 공급 전용 중간 풀은 로컬 학습용이다.
 
 ## 실행 환경
 
@@ -13,6 +14,7 @@ git submodule update --init --recursive
 forge fmt --check
 forge build
 forge test --match-contract MockUSDCTest -vv
+forge test --match-contract LendingPoolTest -vv
 forge test
 ```
 
@@ -35,7 +37,7 @@ forge-std는 현재 설치된 Foundry에서 사용할 조합으로 고정했다.
 [v1.17.0 릴리스](https://github.com/foundry-rs/forge-std/releases/tag/v1.17.0)는 새 `Vm.Gas` 구조 때문에 Foundry v1.8.3 이상을 권고한다.
 EVM 대상은 컴파일러 기본값 변화에 영향을 받지 않도록 명시했다.
 
-## 구현을 읽는 순서
+## MockUSDC를 읽는 순서
 
 | 흐름 | 시작과 결과 | 코드·검증 위치 |
 | --- | --- | --- |
@@ -74,13 +76,103 @@ function decimals() public pure override returns (uint8) {
 지급 함수의 핵심은 OpenZeppelin ERC20의 `_mint(to, amount)` 호출이다.
 정상 호출에서는 수령자의 잔고와 총발행량이 늘어난다. 0 주소는 ERC20이 상태 변경 전에 거절한다.
 
+## 공급 기능을 읽는 순서
+
+공급은 새 토큰을 발행하지 않는다. Alice가 가진 토큰을 풀로 옮기고 그 사람의 공급 권리를 별도 장부에 더한다.
+구현은 [LendingPool](src/LendingPool.sol), 테스트는 [LendingPoolTest](test/LendingPool.t.sol)에 있다.
+먼저 아래 정상 공급 하나를 읽고, 나머지 흐름은 표에서 필요한 부분으로 내려간다.
+
+### Alice의 토큰 이동과 예치 기록은 같은 공급 호출에 묶인다
+
+준비: 새 토큰·풀을 만들고 Alice에게만 200 USDC를 발행한다. Alice는 풀에 100 USDC의 유한 승인을 준다.
+`approve`는 토큰 이동이나 예치 기록 증가를 일으키지 않는다. 그다음 Alice가 `supply(100_000_000)`을 호출한다.
+
+| 관측값 | 공급 직전 | 공급 성공 후 |
+| --- | ---: | ---: |
+| Alice 토큰 | 200 USDC | 100 USDC |
+| 풀 토큰 | 0 | 100 USDC |
+| Alice 예치 기록 | 0 | 100 USDC |
+| Alice → 풀 승인량 | 100 USDC | 0 |
+| 총발행량 | 200 USDC | 200 USDC |
+| Bob 토큰·예치 기록 | 각각 0 | 각각 0 |
+
+실제 핵심 코드는 다음과 같다. 100 USDC의 정수 최소 단위는 `100_000_000`이다.
+
+```solidity
+function supply(uint256 amount) external nonReentrant {
+    if (amount == 0) revert ZeroAmount();
+    asset.safeTransferFrom(msg.sender, address(this), amount);
+    deposits[msg.sender] += amount;
+    emit Supplied(msg.sender, amount);
+}
+```
+
+Alice의 호출에서 `msg.sender`는 Alice이고 `address(this)`는 풀이다.
+토큰 계약에서는 풀이 승인 사용 주체(spender)로 호출한다. Alice가 풀에 준 승인을 사용해 Alice의 잔고를 줄이고 풀의 잔고를 늘린다.
+전송이 성공한 뒤에만 `deposits[Alice]`에 같은 `amount`를 더한다. 이 기록은 새 ERC20이나 토큰 발행량이 아니다.
+
+`test_SupplyMovesTokensAndCreditsOnlyCaller`는 위 표의 값을 실제 검증문으로 비교한다.
+`_assertOneSupplyEvent`는 토큰의 Transfer 로그와 구분해 풀에서 발생한 `Supplied(Alice, 100_000_000)`가 정확히 한 번인지 확인한다.
+
+### 공급이 실패하면 직전 상태가 남는다
+
+승인과 공급은 사용자의 별도 거래다. 공급 실패가 이미 성공한 approve를 취소하는 것은 아니다.
+실패한 supply 안에서 차감한 승인량은 supply 직전 값으로 돌아간다.
+
+예를 들어 잔고 99·승인 100에서 공급 100을 요청하면, ERC20은 승인을 먼저 차감한 뒤 잔고 부족 오류를 낸다.
+그 오류가 전파되어 해당 공급의 변경을 복구하므로 잔고 99·승인 100과 기존 예치 기록이 유지된다.
+풀은 토큰 오류를 잡고 성공으로 진행하지 않는다. false 반환은 SafeERC20이 오류로 바꾸고, 토큰의 명시적 오류는 그대로 전파한다.
+
+전송 실패 테스트는 먼저 40 USDC 공급을 완료하고 새 승인 100을 준 상태에서 시작한다.
+[실패 토큰](test/mocks/FailingMockUSDC.sol)은 실제 전송·승인 차감 후 false를 반환하거나 지정 오류를 낸다.
+공급 실패 뒤 Alice 토큰 160·풀 토큰 40·Alice 예치 40·승인 100이 유지되는지 검사한다.
+`test_FalseTokenControlActuallyMovesTokensBeforeReturningFalse`는 풀 밖에서 모형을 직접 호출해 false와 실제 잔고 변경이 함께 발생함을 대조한다.
+따라서 아무것도 하지 않는 모형을 보고 복구를 검증했다고 해석하지 않는다.
+
+### 새 테스트의 준비·실행·실제 확인
+
+공통 `setUp()`은 각 테스트마다 새 토큰·풀과 Alice의 200 USDC만 준비한다. 서로 다른 테스트의 상태를 공유하지 않는다.
+`_approveAndSupply`는 지정한 사용자의 승인과 공급을 준비하는 함수다.
+`_snapshot`과 `_assertStateUnchanged`는 공급 직전의 Alice·Bob 토큰, 풀 토큰, 양쪽 예치 기록, Alice 승인, 총발행량을 비교한다.
+아래 숫자는 별도 표시가 없으면 USDC이며, 실제 입력과 기대값은 고정한 정수 최소 단위로 작성했다.
+
+| 테스트 | 준비 → 실행 | 실제 확인 |
+| --- | --- | --- |
+| `test_SupplyMovesTokensAndCreditsOnlyCaller` | Alice 200·승인 100 → 공급 100 | 위 표의 7개 관측값과 풀의 공급 이벤트 1회 |
+| `test_ConstructorFixesAsset` | 토큰 주소로 풀 생성 → 자산 조회 | 설정한 토큰 주소와 같음 |
+| `test_ConstructorRejectsZeroAsset` | 0 주소 → 풀 생성 시도 | `InvalidAsset(0)` 오류 |
+| `test_ConstructorRejectsAssetWithoutCode` | 코드 없는 Alice 주소 → 풀 생성 시도 | `InvalidAsset(Alice)` 오류 |
+| `test_AdditionalSupplyAddsToExistingDeposit` | 100 공급 → 추가 승인·공급 20 | Alice 80·풀/예치 120·승인 0·발행량 200·Bob 예치 0, 두 번째 공급 이벤트는 누적 120이 아닌 요청 20으로 1회 |
+| `test_DifferentUsersKeepSeparateDeposits` | Alice 200·Bob 30 → Alice 100, Bob 30 공급 | 예치 각각 100/30·풀 130, Alice 토큰 100·Bob 0, 양쪽 승인 0·발행량 230 |
+| `test_SupplyAcceptsOneSmallestUnit` | Alice 200 → 최소 단위 1 승인·공급 | Alice 199_999_999·풀/예치 1·승인 0·발행량 200_000_000 |
+| `test_ZeroSupplyRevertsWithoutChangingState` | 기존 예치 40·새 승인 100 → 공급 0 | `ZeroAmount()`와 호출 직전 7개 상태 보존 |
+| `test_InsufficientAllowanceRevertsWithoutChangingState` | 기존 예치 40, Alice 토큰을 200으로 준비·승인 99 → 공급 100 | `ERC20InsufficientAllowance(pool, 99, 100)`와 직전 상태 보존 |
+| `test_InsufficientBalanceRestoresSpentAllowanceAndExistingDeposit` | 기존 공급 101 후 잔고 99·승인 100 → 공급 100 | `ERC20InsufficientBalance(Alice, 99, 100)`, 승인 100·기존 예치 101을 포함한 직전 상태 보존 |
+| `test_FalseTokenControlActuallyMovesTokensBeforeReturningFalse` | 장애 토큰 Alice 200·테스트 주소에 승인 100 → Bob에게 직접 전송 | 반환 false, Alice/Bob 각각 100·승인 0·발행량 200. 풀 공급을 거치지 않는 모형 대조 |
+| `test_FalseTransferRollsBackTokenChangesAndKeepsExistingDeposit` | 기존 공급 40·승인 100 → 전송 뒤 false | 정확한 `SafeERC20FailedOperation(token)`과 직전 상태 보존, 기존 예치 40 |
+| `test_RevertingTransferBubblesExactErrorAndPreservesState` | 기존 공급 40·승인 100 → 전송 중 지정 오류 | `InjectedTransferFailure()` 전파와 직전 상태 보존 |
+| `test_DirectTransferDoesNotCreateDepositOrInflateLaterSupply` | Alice 200 → 풀로 직접 전송 10 → 공급 100 | 직접 전송 직후 예치 0·풀 10·공급 이벤트 없음, 이후 Alice 90·풀 110·예치 100·발행량 200 |
+| `test_DirectMintDoesNotChangeExistingDeposits` | 기존 공급 40 → 풀에 직접 발행 10 | Alice 토큰 160·풀 50·예치 40·Bob 예치 0·발행량 210·공급 이벤트 없음 |
+| `test_ReentryIsRejectedWhileOuterSupplySucceedsOnce` | 콜백 토큰에 자체 잔고·승인 최소 단위 1, Alice 200·승인 100 → 공급 100 중 재호출 | 콜백 시도·정확한 guard 오류·바깥 공급만 1회 성공, 토큰 주소의 잔고·승인 1·예치 0 유지 |
+
+재진입 모형은 [ReentrantMockUSDC](test/mocks/ReentrantMockUSDC.sol)에만 있다.
+토큰이 중첩 호출하면 그 호출자는 Alice가 아니라 토큰 주소다. 충분한 자체 잔고·승인과 양수 금액을 준비해 승인·잔고 부족으로 인한 거짓 통과를 막는다.
+중첩 오류를 잡아 바깥 전송을 계속하므로 테스트는 콜백 실행과 오류를 조회할 수 있다.
+재진입 실패와 별도로 Alice의 토큰/예치 100·풀 토큰 100·승인 0·Bob 상태 0, 총발행량 200_000_001, 공급 이벤트 1회를 확인한다.
+추가된 최소 단위 1은 준비에서 발행한 토큰이며 공급이 새로 발행한 수량이 아니다.
+
 ## 이번 코드의 경계
 
 MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이다.
 토큰 발행에는 실제 자산 입금이 없으며, 풀의 예치 권리를 만들지 않는다.
-아직 풀 계약·공급·출금은 구현하지 않았다. 실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다.
+풀은 배포한 자산 하나를 고정하며 본인 공급만 받는다. 자산 변경·타인 대신 공급·출금·이자·대출·구제 함수는 없다.
+출금 없는 중간 풀을 배포하지 않는다. 실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다.
 
-테스트는 추가한 소수점 설정과 지급 연결의 정상·거절 결과를 확인한다.
+풀에 직접 전송·발행한 토큰은 예치 권리를 만들지 않는다. 직접 전송 10 후 정상 공급 100이면 풀 현금은 110이고 예치 권리는 100이다.
+따라서 직접 송금이 있는 경우까지 풀 현금과 예치 합이 항상 같다고 가정하지 않는다.
+생성자의 코드 존재 검사는 모든 ERC20의 안전성을 보장하지 않는다. 재진입 검증도 임의의 악성 자산 지원을 의미하지 않는다.
+
+테스트는 소수점 설정·지급 연결 및 공급의 정상·거절·전송 실패 결과를 확인한다.
 OpenZeppelin의 모든 ERC20 동작이나 실제 USDC 연동을 검증하는 범위는 아니다.
 생성되는 `out/`, `cache/`, `broadcast/`는 버전 관리에서 제외한다.
 
