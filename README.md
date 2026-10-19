@@ -2,8 +2,8 @@
 
 Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학습 프로젝트다.
 현재 구현 범위는 [이슈 #1](https://github.com/0Chord/lending-protocol/issues/1)의 테스트 환경·MockUSDC와
-[#2](https://github.com/0Chord/lending-protocol/issues/2)의 본인 공급·예치 기록이다.
-출금은 [#3](https://github.com/0Chord/lending-protocol/issues/3)에서 이어간다. 공급 전용 중간 풀은 로컬 학습용이다.
+[#2](https://github.com/0Chord/lending-protocol/issues/2)의 본인 공급·예치 기록과
+[#3](https://github.com/0Chord/lending-protocol/issues/3)의 본인 출금이다. 테스트 전용 로컬 학습 프로젝트다.
 
 ## 실행 환경
 
@@ -133,7 +133,8 @@ Alice의 호출에서 `msg.sender`는 Alice이고 `address(this)`는 풀이다.
 
 공통 `setUp()`은 각 테스트마다 새 토큰·풀과 Alice의 200 USDC만 준비한다. 서로 다른 테스트의 상태를 공유하지 않는다.
 `_approveAndSupply`는 지정한 사용자의 승인과 공급을 준비하는 함수다.
-`_snapshot`과 `_assertStateUnchanged`는 공급 직전의 Alice·Bob 토큰, 풀 토큰, 양쪽 예치 기록, Alice 승인, 총발행량을 비교한다.
+`_snapshot`과 `_assertStateUnchanged`는 검사할 호출 직전의 Alice·Bob 토큰, 풀 토큰, 양쪽 예치 기록·승인, 총발행량을 비교한다.
+실패 보존 검사는 양쪽 승인까지 포함해 8개 값을 확인한다.
 아래 숫자는 별도 표시가 없으면 USDC이며, 실제 입력과 기대값은 고정한 정수 최소 단위로 작성했다.
 
 | 테스트 | 준비 → 실행 | 실제 확인 |
@@ -145,7 +146,7 @@ Alice의 호출에서 `msg.sender`는 Alice이고 `address(this)`는 풀이다.
 | `test_AdditionalSupplyAddsToExistingDeposit` | 100 공급 → 추가 승인·공급 20 | Alice 80·풀/예치 120·승인 0·발행량 200·Bob 예치 0, 두 번째 공급 이벤트는 누적 120이 아닌 요청 20으로 1회 |
 | `test_DifferentUsersKeepSeparateDeposits` | Alice 200·Bob 30 → Alice 100, Bob 30 공급 | 예치 각각 100/30·풀 130, Alice 토큰 100·Bob 0, 양쪽 승인 0·발행량 230 |
 | `test_SupplyAcceptsOneSmallestUnit` | Alice 200 → 최소 단위 1 승인·공급 | Alice 199_999_999·풀/예치 1·승인 0·발행량 200_000_000 |
-| `test_ZeroSupplyRevertsWithoutChangingState` | 기존 예치 40·새 승인 100 → 공급 0 | `ZeroAmount()`와 호출 직전 7개 상태 보존 |
+| `test_ZeroSupplyRevertsWithoutChangingState` | 기존 예치 40·새 승인 100 → 공급 0 | `ZeroAmount()`와 호출 직전 8개 상태 보존 |
 | `test_InsufficientAllowanceRevertsWithoutChangingState` | 기존 예치 40, Alice 토큰을 200으로 준비·승인 99 → 공급 100 | `ERC20InsufficientAllowance(pool, 99, 100)`와 직전 상태 보존 |
 | `test_InsufficientBalanceRestoresSpentAllowanceAndExistingDeposit` | 기존 공급 101 후 잔고 99·승인 100 → 공급 100 | `ERC20InsufficientBalance(Alice, 99, 100)`, 승인 100·기존 예치 101을 포함한 직전 상태 보존 |
 | `test_FalseTokenControlActuallyMovesTokensBeforeReturningFalse` | 장애 토큰 Alice 200·테스트 주소에 승인 100 → Bob에게 직접 전송 | 반환 false, Alice/Bob 각각 100·승인 0·발행량 200. 풀 공급을 거치지 않는 모형 대조 |
@@ -161,18 +162,143 @@ Alice의 호출에서 `msg.sender`는 Alice이고 `address(this)`는 풀이다.
 재진입 실패와 별도로 Alice의 토큰/예치 100·풀 토큰 100·승인 0·Bob 상태 0, 총발행량 200_000_001, 공급 이벤트 1회를 확인한다.
 추가된 최소 단위 1은 준비에서 발행한 토큰이며 공급이 새로 발행한 수량이 아니다.
 
+## 출금 기능을 읽는 순서
+
+이번 변화는 풀 안의 토큰을 본인 지갑으로 돌려주면서 본인의 예치 권리를 같은 수량만큼 줄이는 것이다.
+제품 코드는 [LendingPool.withdraw](src/LendingPool.sol#L60), 검증 코드는 [LendingPoolTest](test/LendingPool.t.sol)에 있다.
+먼저 첫 40 출금과 실패 복구를 읽고, 나머지 경계는 아래 테스트 표로 이어간다.
+
+| 흐름 | 시작 → 결과 |
+| --- | --- |
+| 정상 출금 | 본인 예치·현금이 충분함 → 기록 차감·토큰 반환·출금 이벤트 1회 |
+| 요청 거절 | 0 → 본인 예치 부족 → 현금 부족 순으로 검사 → 정확한 오류, 상태 보존 |
+| 토큰 실패 | 기록을 줄인 뒤 transfer에서 false/revert → 해당 출금의 모든 변경 복구 |
+| 중첩 호출 | 전송 중 supply/withdraw 재호출 → 공통 잠금으로 중첩 동작 거절 |
+| 직접 유입 | 풀에 직접 transfer/mint → 현금만 증가, 출금 권리는 생기지 않음 |
+
+### 첫 40 출금: 새 승인이 없어도 토큰을 돌려받는다
+
+준비(Given): Alice 초기 토큰 200에서 정상 승인·공급 100을 마친다. Alice 토큰·예치·풀 현금은 각각 100이고 공급 승인은 0이다.
+실행(When): Alice가 새 approve 없이 `withdraw(40_000_000)`을 호출한다.
+확인(Then): `test_WithdrawMovesTokensAndDebitsOnlyCallerWithoutNewApproval`이 다음 고정값을 비교한다.
+
+| 관측값 | 출금 직전 | 성공 후 |
+| --- | ---: | ---: |
+| Alice 토큰 | 100 | 140 |
+| Alice 예치 | 100 | 60 |
+| 풀 토큰 | 100 | 60 |
+| Alice → 풀 승인 | 0 | 0 |
+| 총발행량 | 200 | 200 |
+| Bob 토큰·예치 | 각각 0 | 각각 0 |
+
+표는 USDC 단위이며 실제 테스트에서는 6자리 정수 최소 단위를 사용한다.
+풀 emitter·출금 서명·indexed Alice·요청액 40·정확히 1회도 별도로 검사한다. 준비 공급의 이벤트는 로그 기록 전에 끝낸다.
+
+```solidity
+function withdraw(uint256 amount) external nonReentrant {
+    if (amount == 0) revert ZeroAmount();
+    uint256 deposited = deposits[msg.sender];
+    if (amount > deposited) revert InsufficientDeposit(deposited, amount);
+    uint256 cash = asset.balanceOf(address(this));
+    if (amount > cash) revert InsufficientLiquidity(cash, amount);
+
+    deposits[msg.sender] = deposited - amount;
+    asset.safeTransfer(msg.sender, amount);
+    emit Withdrawn(msg.sender, amount);
+}
+```
+
+`msg.sender`는 출금을 요청한 Alice다. 풀은 자기 토큰을 보내므로 사용자의 승인을 쓰는 transferFrom 대신 transfer를 호출한다.
+`safeTransfer`는 그 transfer가 false를 반환하면 오류로 바꾸고, 토큰이 낸 오류도 전파한다.
+기록은 외부 토큰 호출 전에 차감한다. 공급·출금은 같은 `nonReentrant` 잠금을 사용한다.
+
+### 왜 먼저 줄인 예치가 전송 실패 때 복구되는가
+
+사용자가 먼저 함께 확인하고 싶다고 답한 부분은 전송 실패 시 예치 복구다.
+예치 차감과 토큰 호출은 하나의 withdraw 실행 안에 있다. 풀에서 오류를 잡고 성공으로 바꾸지 않으므로
+오류가 호출자까지 전파되면 그 출금에서 바뀐 예치 기록과 하위 토큰 호출의 상태가 모두 되돌아간다.
+앞선 별도 거래의 공급 100은 취소되지 않는다.
+
+`test_FalseWithdrawalTokenControlActuallyTransfersBeforeReturningFalse`는 풀 밖에서 실패 모형을 직접 호출한다.
+Alice 200에서 Bob에게 40을 보내면 반환값은 false이지만 Alice 160·Bob 40이 남는다. 모형이 실제 전송을 하는 대조다.
+
+`test_FalseWithdrawalRestoresDebitedDepositAndTransferredTokensThenAllowsRetry`는 이를 풀에 연결한다.
+
+1. 준비: 장애를 끈 모형으로 정상 공급 100을 완료하고 양쪽 승인을 7/9 최소 단위로 남긴다.
+2. 실패 실행: transfer 장애를 켜고 40 출금한다. 모형은 실제로 토큰을 보낸 뒤 false를 반환한다.
+3. 실패 확인: 정확한 `SafeERC20FailedOperation(token)` 오류와 함께 Alice 토큰 100·예치 100·풀 100, 양쪽 승인·Bob 상태·총량이 직전 값으로 돌아온다.
+4. 재시도: 장애를 끄고 다시 40 출금한다. Alice 140·예치 60·풀 60·승인 7/9·총량 200과 출금 이벤트 1회를 확인한다.
+
+명시적 revert도 별도 테스트에서 `InjectedTransferFailure()` 원문과 직전 8개 상태 보존을 확인한다.
+[FailingMockUSDC](test/mocks/FailingMockUSDC.sol)의 transferFrom 장애는 기존 공급용, transfer 장애는 출금용으로 따로 설정한다.
+장애 설정은 테스트 모형에만 있다.
+
+### 출금 테스트의 준비·실행·실제 확인
+
+공통 준비는 위 공급 테스트와 같으며 출금 권리는 정상 `_approveAndSupply`로 만든다.
+아래 숫자는 USDC 단위이고 최소 단위·승인 7/9는 별도로 표시했다. 각 테스트는 새 토큰·풀에서 독립적으로 시작한다.
+
+| 테스트 | 준비 → 실행 | 실제 확인 |
+| --- | --- | --- |
+| `test_WithdrawMovesTokensAndDebitsOnlyCallerWithoutNewApproval` | 공급 100·승인 0 → 40 출금 | 위 첫 출금 표와 요청액 40 이벤트 1회 |
+| `test_AdditionalWithdrawalDebitsRemainingDepositAndEmitsRequestedAmount` | 100 공급·40 출금 → 추가 20 | Alice 160·예치/풀 40·총량 200·승인 0, 두 번째 이벤트는 요청 20으로 1회 |
+| `test_WithdrawAcceptsFullDeposit` | 공급 100 → 100 출금 | Alice 200·예치/풀 0·승인 0·총량 200 |
+| `test_WithdrawAcceptsExactlyRemainingDepositAndCash` | 공급 100·40 출금 → 남은 60 출금 | 직전 예치/현금 60 확인 후 Alice 200·예치/풀 0·총량 200 |
+| `test_WithdrawAcceptsOneSmallestUnit` | 공급 100 → 최소 단위 1 출금 | Alice 100_000_001·예치/풀 99_999_999·승인 0·총량 200_000_000 |
+| `test_ZeroWithdrawalTakesPriorityWhenDepositAndCashAreZero` | 예치/현금 0 → 0 출금 | `ZeroAmount()` 우선, 직전 8개 상태 유지 |
+| `test_ZeroWithdrawalKeepsPreviousWithdrawalAndApprovals` | 공급 100·출금 40·양쪽 승인 7/9 → 0 출금 | 금액 오류와 기존 출금 결과·승인 보존 |
+| `test_ExcessWithdrawalRejectsDepositBeforeLiquidityAndPreservesState` | 예치/현금 60 → 61 출금 | `InsufficientDeposit(60, 61)` 우선, 직전 상태 유지 |
+| `test_IlliquidWithdrawalRejectsWholeRequestAndPreservesAdjustedState` | 공급 100 후 현금만 50으로 조정 → 60 요청 | `InsufficientLiquidity(50, 60)`와 조정 후 상태 보존, 부분 지급 없음 |
+| `test_WithdrawAcceptsExactCashLimitBelowDeposit` | 예치 100·조정된 현금 50 → 50 출금 | Alice 150·예치 50·풀 0·승인 0·조정 총량 150 |
+| `test_WithdrawalWithoutOwnDepositPreservesOtherUserFunds` | Alice 예치 100·Bob 예치 0 → Bob이 1 요청 | `InsufficientDeposit(0, 1)`, 직전 상태 유지 |
+| `test_WithdrawalKeepsOtherDepositorAndExistingApprovals` | Alice/Bob 100/30 공급·승인 7/9 → Alice 40 출금 | Alice 토큰140·예치60, Bob 토큰0·예치30, 풀90·승인7/9·총량230 |
+| `test_DirectDonorCannotWithdrawWithoutDeposit` | Alice 공급100·Bob 직접 송금10 → Bob이1 요청 | 풀110·총량210·Bob 권리0 먼저 확인 후 예치금 오류·상태 보존 |
+| `test_DirectMintCannotCreateWithdrawalRight` | Alice 공급100·풀에 직접 발행10 → Bob이1 요청 | 위와 같은 권리 부재·정확한 오류·상태 보존 |
+| `test_FalseWithdrawalTokenControlActuallyTransfersBeforeReturningFalse` | 모형 Alice200 → Bob에게40 직접 전송 | false와 실제 Alice160·Bob40·총량200 |
+| `test_FalseWithdrawalRestoresDebitedDepositAndTransferredTokensThenAllowsRetry` | 정상 공급100 → false 출금40 → 장애 해제·재시도40 | 실패 직전 상태 복구 후 정상 출금 결과·이벤트1회 |
+| `test_RevertingWithdrawalBubblesExactErrorAndPreservesState` | 정상 공급100 → transfer의 지정 오류 | 정확한 토큰 오류 전파·직전 8개 상태 보존 |
+
+현금 부족 준비의 `deal(token, pool, 50_000_000, true)`는 테스트 도구의 ERC20 저장소 조정이다.
+예치 100은 유지하지만 풀 잔고 100→50의 차이만큼 총발행량도 200→150이 된다. 조정 직후 값을 먼저 확인하고
+그 시점을 snapshot으로 삼는다. 정상 공급·출금으로 현금 부족을 만들었다고 주장하지 않는다.
+
+### 중첩 호출을 잡는 경우와 전파하는 경우
+
+기존 `ReentrantMockUSDC`는 공급 → 공급을 확인한다. 새 [CrossReentrantMockUSDC](test/mocks/CrossReentrantMockUSDC.sol)는
+실제 transferFrom/transfer를 마친 뒤 토큰 주소가 최소 단위 1의 공급 또는 출금을 한 번 재호출한다.
+테스트 모형이며 생산 토큰에 이런 콜백을 추가하지 않는다.
+
+준비: 토큰 주소에 최소 단위 2를 발행하고 콜백을 끈 정상 supply로 1을 예치한다.
+따라서 자체 잔고1·예치1이 남고, 콜백을 켤 때 자체 승인1을 준다.
+중첩 호출자는 Alice가 아니라 토큰 주소다. 권리·잔고·승인이 모두 있어야 잠금 대신 다른 부족 오류로 통과하는 일을 막을 수 있다.
+총발행량은 200_000_002이며 Alice 100 공급 후 풀은 자체 예치 1을 포함해 100_000_001이다.
+
+| 테스트 | 실행 | 실제 확인 |
+| --- | --- | --- |
+| `test_SupplyRejectsNestedWithdrawalWithFundedDeposit` | Alice 공급100 중 토큰이 출금1 최소 단위 재호출 | 시도·정확한 guard 오류, Alice 토큰/예치100·풀100_000_001·공급 이벤트1회·출금 이벤트 없음, 자체 잔고/예치/승인1 보존 |
+| `test_WithdrawRejectsNestedSupplyAndExposesDebitedDeposit` | Alice 출금40 중 토큰이 공급1 재호출 | guard 오류를 잡아 Alice140·예치60·풀60_000_001·출금 이벤트1회·공급 이벤트 없음, 콜백이 읽은 Alice 예치60 |
+| `test_WithdrawRejectsNestedWithdrawalWhileOuterSucceedsOnce` | Alice 출금40 중 토큰이 출금1 재호출 | 중첩만 정확한 guard 오류, 바깥 출금40만 반영·이벤트1회·자체 잔고/권리/승인1 유지 |
+| `test_PropagatedNestedWithdrawalRestoresTokensDepositAndCallbackState` | 실제 전송 후 중첩 출금 오류를 바깥으로 전파 | 바깥도 같은 guard 오류, Alice100·예치100·풀100_000_001·직전 8개 상태·자체 잔고/예치/승인1 복구, attempted=false·오류 기록/관측값도 초기화 |
+
+표의 Alice·예치 정수는 USDC, 풀 값의 언더스코어 표기는 최소 단위다.
+오류를 잡는 세 사례는 attempted·nestedSucceeded=false·오류 bytes와 바깥 1회분을 함께 확인한다.
+공급 중 콜백은 바깥 예치 증가 전이므로 Alice 예치0을 관측한다. 출금 중 콜백은 예치 선차감 후의 60을 관측한다.
+
+오류를 전파한 마지막 사례는 그 콜백의 attempted 저장까지 취소된다. 실패 후 attempted=true를 기대하면 EVM 복구와 모순된다.
+정확한 guard 오류가 바깥으로 나오는 것과 직전 상태 복구를 확인하며, 오류를 잡는 사례의 관측과 구분한다.
+
 ## 이번 코드의 경계
 
 MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이다.
 토큰 발행에는 실제 자산 입금이 없으며, 풀의 예치 권리를 만들지 않는다.
-풀은 배포한 자산 하나를 고정하며 본인 공급만 받는다. 자산 변경·타인 대신 공급·출금·이자·대출·구제 함수는 없다.
-출금 없는 중간 풀을 배포하지 않는다. 실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다.
+풀은 배포한 자산 하나를 고정하며 본인 공급과 본인 지갑으로의 출금만 받는다. 자산 변경·타인 대신 공급·수령자 지정·이자·대출·구제 함수는 없다.
+실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다. 배포는 이번 작업 범위에 포함하지 않는다.
 
 풀에 직접 전송·발행한 토큰은 예치 권리를 만들지 않는다. 직접 전송 10 후 정상 공급 100이면 풀 현금은 110이고 예치 권리는 100이다.
 따라서 직접 송금이 있는 경우까지 풀 현금과 예치 합이 항상 같다고 가정하지 않는다.
 생성자의 코드 존재 검사는 모든 ERC20의 안전성을 보장하지 않는다. 재진입 검증도 임의의 악성 자산 지원을 의미하지 않는다.
 
-테스트는 소수점 설정·지급 연결 및 공급의 정상·거절·전송 실패 결과를 확인한다.
+테스트는 소수점 설정·지급 연결 및 공급·출금의 정상·거절·전송 실패 결과를 확인한다.
 OpenZeppelin의 모든 ERC20 동작이나 실제 USDC 연동을 검증하는 범위는 아니다.
 생성되는 `out/`, `cache/`, `broadcast/`는 버전 관리에서 제외한다.
 
