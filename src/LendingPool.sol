@@ -4,17 +4,22 @@ pragma solidity 0.8.37;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ShareMath} from "./libraries/ShareMath.sol";
 
 /// @title 이자 없는 MockUSDC 공급·출금 실습
-/// @notice 호출자 본인의 토큰과 예치 권리를 같은 수량으로 교환한다.
+/// @notice 본인 공급·출금의 권리를 지분으로 기록하고 USDC 금액으로 환산한다.
 /// @dev 표준 MockUSDC를 위한 로컬 학습 단계이며 이자·대출은 다루지 않는다.
 contract LendingPool is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     /// @notice 배포 때 고정한 공급 자산이다.
     IERC20 public immutable asset;
-    /// @notice 직접 전송·발행과 구분한 주소별 공급 권리의 최소 단위 수량이다.
-    mapping(address => uint256) public deposits;
+    /// @notice 직접 전송·발행과 구분해 장부에서 인정한 USDC 자산이다.
+    uint256 internal _accountedAssets;
+    /// @notice 공급자의 지분 최소 단위 수량의 합이다.
+    uint256 public totalShares;
+    /// @notice 전송 가능한 토큰과 구분한 주소별 내부 지분이다.
+    mapping(address => uint256) public shares;
 
     /// @notice 실제 전송에 성공한 공급의 주체와 최소 단위 수량을 알린다.
     event Supplied(address indexed user, uint256 amount);
@@ -24,6 +29,12 @@ contract LendingPool is ReentrancyGuard {
 
     /// @notice 0 금액 공급·출금은 유효한 동작으로 취급하지 않는다.
     error ZeroAmount();
+
+    /// @notice 양수 공급으로 지분을 받지 못하면 토큰을 받지 않고 거절한다.
+    error ZeroShares();
+
+    /// @notice 마지막 총지분을 없애면서 인정자산을 남기는 출금은 거절한다.
+    error ResidualAssets(uint256 remainingAssets);
 
     /// @notice 본인의 예치 권리를 초과하는 출금은 부분 지급 없이 거절한다.
     error InsufficientDeposit(uint256 available, uint256 requested);
@@ -44,27 +55,48 @@ contract LendingPool is ReentrancyGuard {
         asset = asset_;
     }
 
-    /// @notice 본인의 토큰을 풀로 옮긴 뒤 같은 수량의 예치 기록을 더한다.
+    /// @notice 실제 토큰 현금과 구분한 인정자산의 최소 단위 수량을 반환한다.
+    function totalAssets() external view returns (uint256) {
+        return _accountedAssets;
+    }
+
+    /// @notice 본인 지분의 USDC 가치를 최소 단위에서 내려 반환한다.
+    /// @dev 지분0 주소도 잘못된 장부를 숨기지 않고 계산 모듈의 오류를 전파한다.
+    /// @param user 환산할 지분의 소유자
+    function deposits(address user) public view returns (uint256) {
+        return ShareMath.toAssetsDown(shares[user], _accountedAssets, totalShares);
+    }
+
+    /// @notice 공급 전 비율로 받을 지분을 계산하고 토큰 전송 뒤 기록한다.
     /// @dev 토큰 전송 실패를 전파하므로 실패한 공급의 상태 변경은 모두 복구된다.
     /// @param amount 소수점 6자리가 적용된 정수 최소 단위 수량
     function supply(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
+        uint256 mintedShares = ShareMath.toSharesDown(amount, _accountedAssets, totalShares);
+        if (mintedShares == 0) revert ZeroShares();
         asset.safeTransferFrom(msg.sender, address(this), amount);
-        deposits[msg.sender] += amount;
+        _accountedAssets += amount;
+        totalShares += mintedShares;
+        shares[msg.sender] += mintedShares;
         emit Supplied(msg.sender, amount);
     }
 
-    /// @notice 본인 예치 기록을 줄이고 같은 수량을 본인 지갑으로 돌려준다.
-    /// @dev 공급과 잠금을 공유하며 전송 실패는 앞선 기록 차감까지 복구한다.
+    /// @notice 요청한 USDC에 필요한 지분을 올림해 차감하고 본인에게 지급한다.
+    /// @dev 공급과 잠금을 공유하며 전송 실패는 자산·총지분·본인 지분 차감까지 복구한다.
     /// @param amount 소수점 6자리가 적용된 정수 최소 단위 수량
     function withdraw(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        uint256 deposited = deposits[msg.sender];
+        uint256 deposited = deposits(msg.sender);
         if (amount > deposited) revert InsufficientDeposit(deposited, amount);
         uint256 cash = asset.balanceOf(address(this));
         if (amount > cash) revert InsufficientLiquidity(cash, amount);
 
-        deposits[msg.sender] = deposited - amount;
+        uint256 burnedShares = ShareMath.toSharesUp(amount, _accountedAssets, totalShares);
+        uint256 remainingAssets = _accountedAssets - amount;
+        if (burnedShares == totalShares && remainingAssets != 0) revert ResidualAssets(remainingAssets);
+        _accountedAssets = remainingAssets;
+        totalShares -= burnedShares;
+        shares[msg.sender] -= burnedShares;
         asset.safeTransfer(msg.sender, amount);
         emit Withdrawn(msg.sender, amount);
     }
