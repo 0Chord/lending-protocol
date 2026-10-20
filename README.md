@@ -5,7 +5,8 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#2](https://github.com/0Chord/lending-protocol/issues/2)의 본인 공급·예치 기록과
 [#3](https://github.com/0Chord/lending-protocol/issues/3)의 본인 출금과
 [#7](https://github.com/0Chord/lending-protocol/issues/7)의 지분 환산 계산과
-[#8](https://github.com/0Chord/lending-protocol/issues/8)의 공급·출금·조회 연결이다. 테스트 전용 로컬 학습 프로젝트다.
+[#8](https://github.com/0Chord/lending-protocol/issues/8)의 공급·출금·조회 연결과
+[#11](https://github.com/0Chord/lending-protocol/issues/11)의 테스트용 MockWBTC다. 테스트 전용 로컬 학습 프로젝트다.
 
 ## 실행 환경
 
@@ -16,6 +17,7 @@ git submodule update --init --recursive
 forge fmt --check
 forge build
 forge test --match-contract MockUSDCTest -vv
+forge test --match-contract MockWBTCTest -vv
 forge test --match-contract LendingPoolTest -vv
 forge test --match-contract LendingPoolSharesTest -vv
 forge test --match-contract ShareMathTest -vv
@@ -40,6 +42,49 @@ forge test
 forge-std는 현재 설치된 Foundry에서 사용할 조합으로 고정했다.
 [v1.17.0 릴리스](https://github.com/foundry-rs/forge-std/releases/tag/v1.17.0)는 새 `Vm.Gas` 구조 때문에 Foundry v1.8.3 이상을 권고한다.
 EVM 대상은 컴파일러 기본값 변화에 영향을 받지 않도록 명시했다.
+
+## 이번에 읽을 동작: 담보 실습용 MockWBTC
+
+#11은 **소수점 8자리 토큰과 테스트 잔고 발행**만 추가한다.
+실제 BTC를 보관하거나 BTC와 교환하는 기능은 없다. 기존 LendingPool은 계속 MockUSDC만 사용한다.
+WBTC 담보 입금·반환은 후속 [#13](https://github.com/0Chord/lending-protocol/issues/13)에서 연결한다.
+
+먼저 [MockWBTC](src/mocks/MockWBTC.sol)의 `decimals()`를 읽고,
+[MockWBTCTest](test/MockWBTC.t.sol)의 `test_DecimalsAreEight`에서 고정값 `8`과 비교하는 검증문을 확인한다.
+같은 정수 `100_000_000`도 MockWBTC에서는 **1 WBTC**, 기존 MockUSDC에서는 **100 USDC**다.
+소수점 설정은 표시 방법만 정하며, `mint` 입력이나 잔고를 자동으로 환산하지 않는다.
+
+다음은 새 토큰에서 Alice에게 1 WBTC를 발행하는 흐름이다.
+
+```solidity
+function mint(address to, uint256 amount) external {
+    _mint(to, amount);
+}
+```
+
+호출자가 `mint(Alice, 100_000_000)`을 실행하면 상속한 ERC20의 `_mint`가 수령자를 검사한다.
+정상 주소라면 Alice 잔고와 총발행량을 각각 `100_000_000` 늘리고,
+0 주소에서 Alice에게 발행했다는 `Transfer` 이벤트를 남긴다. Bob의 잔고는 그대로다.
+이 함수는 누구나 호출하는 테스트 잔고 준비 수단이며, 승인·실제 BTC 입금·풀 예치 기록과는 별개다.
+
+각 테스트의 `setUp()`은 새 토큰을 배포하므로 다른 테스트의 잔고를 이어받지 않는다.
+Alice와 Bob은 테스트용 주소다. 아래 기대값은 모두 이슈에서 정한 **WBTC 정수 최소 단위**다.
+
+| 테스트 | 준비 → 실행 | 실제 비교하는 결과 |
+| --- | --- | --- |
+| `test_DecimalsAreEight` | 새 토큰 → `decimals()` 조회 | `8` |
+| `test_MintCreditsOnlyRecipientAndIncreasesTotalSupply` | Alice·Bob·총발행량 0 → Alice에게 `100_000_000` 발행 | Alice `100_000_000`, Bob `0`, 총발행량 `100_000_000`. 토큰 주소의 Transfer가 정확히 1회이며 from 0·to Alice·수량도 일치 |
+| `test_MintAddsToExistingBalances` | Alice `25_000_000`·Bob `7_000_000` → Alice에게 `100_000_000` 추가 | Alice `125_000_000`, Bob `7_000_000`, 총발행량 `132_000_000` |
+| `test_MintToZeroAddressRevertsWithoutChangingSupply` | Alice `25_000_000` → 0 주소에 `100_000_000` 발행 시도 | `ERC20InvalidReceiver(address(0))`. Alice `25_000_000`, Bob·0 주소 `0`, 총발행량 `25_000_000` 유지, 실패 요청의 로그 0개 |
+| `test_NonDeployerCanMintTestBalance` | 새 토큰 → 배포자가 아닌 Bob이 Alice에게 `50_000_000` 발행 | Alice `50_000_000`, Bob `0`, 총발행량 `50_000_000` |
+
+0 주소 발행은 `_mint`가 장부를 바꾸기 전에 거절한다. 예외를 잡고 성공으로 진행하지 않는다.
+이 실패 시험은 기존 값 보존을 확인하며, 이미 이동한 토큰의 복구를 시험하는 것은 아니다.
+성공 테스트는 실제 로그의 발행 주소·서명·수령자·수량·횟수를 비교한다.
+테스트에서 쓰는 Bob 호출자 설정은 새 토큰을 발행하는 것이 아니라 호출 주체를 바꾼다.
+
+위 검사는 로컬 Mock의 단위·발행 연결을 확인한다. 실제 WBTC의 BTC 준비금·발행 권한·교환 서비스 연동이나
+후속 담보·가격·대출 기능을 검증하지 않는다. 기존 MockUSDC·풀·지분 테스트도 별도로 유지한다.
 
 ## 먼저 읽을 동작: 지분을 저장하고 예치금을 계산한다
 
