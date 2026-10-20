@@ -3,7 +3,8 @@
 Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학습 프로젝트다.
 현재 구현 범위는 [이슈 #1](https://github.com/0Chord/lending-protocol/issues/1)의 테스트 환경·MockUSDC와
 [#2](https://github.com/0Chord/lending-protocol/issues/2)의 본인 공급·예치 기록과
-[#3](https://github.com/0Chord/lending-protocol/issues/3)의 본인 출금이다. 테스트 전용 로컬 학습 프로젝트다.
+[#3](https://github.com/0Chord/lending-protocol/issues/3)의 본인 출금과
+[#7](https://github.com/0Chord/lending-protocol/issues/7)의 지분 환산 계산이다. 테스트 전용 로컬 학습 프로젝트다.
 
 ## 실행 환경
 
@@ -15,6 +16,7 @@ forge fmt --check
 forge build
 forge test --match-contract MockUSDCTest -vv
 forge test --match-contract LendingPoolTest -vv
+forge test --match-contract ShareMathTest -vv
 forge test
 ```
 
@@ -286,6 +288,78 @@ Alice 200에서 Bob에게 40을 보내면 반환값은 false이지만 Alice 160�
 
 오류를 전파한 마지막 사례는 그 콜백의 attempted 저장까지 취소된다. 실패 후 attempted=true를 기대하면 EVM 복구와 모순된다.
 정확한 guard 오류가 바깥으로 나오는 것과 직전 상태 복구를 확인하며, 오류를 잡는 사례의 관측과 구분한다.
+
+## 지분 환산을 읽는 순서
+
+[#7](https://github.com/0Chord/lending-protocol/issues/7)은 USDC와 지분을 환산하는 계산기다.
+[ShareMath](src/libraries/ShareMath.sol)는 internal pure 라이브러리이며 토큰 이동·지분 발행·저장소 변경을 하지 않는다.
+기존 LendingPool은 아직 이 계산기를 호출하지 않는다. 공급·출금·조회의 지분 회계 연결은 후속 [#8](https://github.com/0Chord/lending-protocol/issues/8)이다.
+
+A는 풀에서 인정한 USDC 자산, S는 총지분이다. 모든 인수·반환값은 정수 최소 단위다.
+USDC·지분을 소수점 6자리로 표현하면 자산 10 USDC·총지분 6개는 A=10_000_000, S=6_000_000이다.
+이 비율은 계산 테스트의 가정이며 현재 풀에 수익을 만드는 기능이 있다는 뜻은 아니다.
+
+| 읽을 흐름 | 계산·코드 | 확인할 결과 |
+| --- | --- | --- |
+| USDC → 지분 | `toSharesDown` / `toSharesUp`: 금액×S÷A | 공급 지분 내림 / 출금 차감 지분 올림 |
+| 지분 → USDC | `toAssetsDown`: 지분×A÷S | USDC 가치 내림 |
+| 장부·정수 경계 | `_isEmptyAccounting`, 고정 OpenZeppelin `Math.mulDiv` | 초기 1:1 / 잘못된 장부 오류 / 최종 정수 범위 초과 오류 |
+
+### 첫 테스트는 실제 계산 결과를 미리 정한 정답과 비교한다
+
+준비: A=10_000_000, S=6_000_000이고 환산할 USDC는 1_000_001이다.
+실행: 공급용 내림과 출금용 올림 함수를 각각 호출한다.
+확인: [첫 테스트](test/ShareMath.t.sol)의 `test_ShareConversionsRoundInOppositeDirections`는 아래 두 값을 비교한다.
+
+```solidity
+assertEq(ShareMath.toSharesDown(1_000_001, 10_000_000, 6_000_000), 600_000);
+assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
+```
+
+`assertEq(실제 결과, 기대값)`는 두 값이 다르면 실패한다.
+정확한 계산은 600_000.6이므로 내림은 600_000, 올림은 600_001이다. 지분 개수로는 0.600000개·0.600001개다.
+핵심 구현은 `Math.mulDiv(assets, totalShares, accountedAssets, Math.Rounding.Floor)`이며 올림 함수는 `Ceil`을 사용한다.
+이 테스트의 통과는 두 계산 결과가 정답과 같았다는 뜻이다. 실제 USDC 공급·출금이나 토큰 이동을 실행한 것은 아니다.
+4 USDC처럼 정확히 나누어떨어지면 두 방향 모두 2.4지분(2_400_000)이며 3지분으로 올리지 않는다.
+
+### 장부 검사와 계산 범위
+
+세 함수 모두 입력 수량 처리 전에 장부를 검사한다. A/S 중 한쪽만 0이면 입력이 0이어도
+`InvalidAccountingState(A, S)`로 거절한다. 둘 다 0이면 초기 1:1 계산으로 입력을 그대로 반환한다.
+빈 장부의 수학적 반환값이 실제 보유 지분·출금 권리를 만들지는 않는다. 두 장부 값이 양수이면 입력 0은 0이다.
+
+`Math.mulDiv`는 중간 곱이 uint256을 넘더라도 최종 정수 결과가 범위 안이면 계산한다.
+최종 내림 또는 올림 결과가 uint256 범위를 넘으면 정확한 `Panic(uint256)` 코드 `0x11`이 전파된다.
+지분 0이나 총지분 전체가 반환되는 계산은 성공한다. 실제 거래의 0 금액·개인 권리·현금·잔여 자산 검사는 #8의 풀 책임이다.
+
+<details>
+<summary>나머지 테스트의 준비·실행·실제 확인 결과</summary>
+
+테스트는 [ShareMathTest](test/ShareMath.t.sol)에 있다. 아래 D/U/V는 각각 `toSharesDown` / `toSharesUp` / `toAssetsDown`이고 M은 `type(uint256).max`다.
+정상 계산은 internal 함수를 직접 사용한다. 오류는 같은 라이브러리를 호출하는 시험 전용 `ShareMathHarness`를 새로 배포해 외부 호출에서 관측한다.
+이 wrapper는 계산을 복제하지 않는다. 다른 테스트용 토큰·외부 서비스·RPC는 사용하지 않는다.
+각 행의 숫자는 전부 정수 최소 단위이며 기대값은 명세의 고정 예시다.
+
+| 테스트 | 준비·실행 | 실제 assertion |
+| --- | --- | --- |
+| `test_AssetConversionRoundsDown` | A10_000_000/S6_000_000에서 지분2_400_000, A10/S6에서 지분1을 V로 환산 | 각각4_000_000·1 |
+| `test_EmptyAccountingUsesOneToOneForAllInputs` | A=S=0, 입력0/1/100_000_000/M을 D/U/V에 적용 | 세 함수 모두 입력 그대로 |
+| `test_ZeroInputWithValidAccountingReturnsZero` | A10/S6, 입력0을 D/U/V에 적용 | 모두0 |
+| `test_MissingAssetsRevertsEvenForZeroInput` | A0/S1, 입력0·1을 D/U/V에 적용 | 정확한 오류 종류와 인수(0,1) |
+| `test_MissingSharesRevertsEvenForZeroInput` | A1/S0, 입력0·1을 D/U/V에 적용 | 정확한 오류 종류와 인수(1,0) |
+| `test_ExactShareConversionsPreserveFractionalShares` | A=S=100_000_000에서 금액40_000_000, A10_000_000/S6_000_000에서 금액4_000_000을 D/U로 환산 | 각각40_000_000·2_400_000 |
+| `test_SmallestAssetMayConvertToZeroShares` | A10/S6에서 금액1을 D/U로 환산 | D0·U1, 계산 자체 성공 |
+| `test_LastTotalSharesIsACalculationResult` | A10_000_000/S6_000_000에서 금액9_999_999를 U로 환산 | 총지분과 같은6_000_000 반환 |
+| `test_IntermediateProductCanOverflowWhenResultFits` | A=S=2에서 입력M을 D/U/V로 환산 | 중간 곱2M에도 모두M |
+| `test_FloorCanReturnMaxBeforeCeilOverflows` | A=M−2/S=M−1에서 금액M−1을 D/U로 환산 | D=M 성공, U만 정확한 Panic(0x11) |
+| `test_ShareConversionsRejectOverflowingResults` | A=M−1/S=M에서 금액M을 D/U로 환산 | 둘 다 정확한 Panic(0x11) |
+| `test_AssetConversionRejectsOverflowingResult` | A=M/S=M−1에서 지분M을 V로 환산 | 정확한 Panic(0x11) |
+
+첫 테스트를 포함해 테스트 함수는 13개다. 빈 장부·잘못된 장부의 고정 반복 입력을 별도 테스트 함수 수로 세지 않는다.
+오류 테스트는 아무 revert나 인정하지 않고 전체 오류 데이터와 Panic 코드를 비교한다.
+순수 계산 검증이며 #8의 토큰 전송·장부 저장·재진입 방어를 미리 검증한 것이 아니다.
+
+</details>
 
 ## 이번 코드의 경계
 
