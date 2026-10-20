@@ -33,6 +33,10 @@ contract LendingPoolTest is Test {
         uint256 allowance;
         uint256 bobAllowance;
         uint256 totalSupply;
+        uint256 accountedAssets;
+        uint256 totalShares;
+        uint256 aliceShares;
+        uint256 bobShares;
     }
 
     /// @notice 테스트마다 새 풀과 토큰을 만들고 Alice에게만 200 USDC를 준비한다.
@@ -50,6 +54,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(ALICE), 200_000_000);
         assertEq(token.balanceOf(address(pool)), 0);
         assertEq(pool.deposits(ALICE), 0);
+        _assertAccounting(pool, 0, 0, 0, 0);
         assertEq(token.allowance(ALICE, address(pool)), 100_000_000);
         assertEq(token.totalSupply(), 200_000_000);
 
@@ -61,6 +66,10 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(ALICE), 100_000_000);
         assertEq(token.balanceOf(address(pool)), 100_000_000);
         assertEq(pool.deposits(ALICE), 100_000_000);
+        assertEq(pool.totalAssets(), 100_000_000);
+        assertEq(pool.totalShares(), 100_000_000);
+        assertEq(pool.shares(ALICE), 100_000_000);
+        assertEq(pool.shares(BOB), 0);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
         assertEq(token.balanceOf(BOB), 0);
@@ -71,6 +80,7 @@ contract LendingPoolTest is Test {
     /// @notice 배포 때 지정한 자산을 그대로 조회할 수 있다.
     function test_ConstructorFixesAsset() public view {
         assertEq(address(pool.asset()), address(token));
+        _assertAccounting(pool, 0, 0, 0, 0);
     }
 
     /// @notice 토큰 호출이 불가능한 0 주소를 배포 단계에서 거절한다.
@@ -97,6 +107,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(ALICE), 80_000_000);
         assertEq(token.balanceOf(address(pool)), 120_000_000);
         assertEq(pool.deposits(ALICE), 120_000_000);
+        _assertAccounting(pool, 120_000_000, 120_000_000, 120_000_000, 0);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
         assertEq(pool.deposits(BOB), 0);
@@ -108,6 +119,7 @@ contract LendingPoolTest is Test {
         token.mint(BOB, 30_000_000);
         _approveAndSupply(token, pool, ALICE, 100_000_000);
         assertEq(pool.deposits(BOB), 0);
+        _assertAccounting(pool, 100_000_000, 100_000_000, 100_000_000, 0);
 
         _approveAndSupply(token, pool, BOB, 30_000_000);
 
@@ -116,6 +128,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(address(pool)), 130_000_000);
         assertEq(pool.deposits(ALICE), 100_000_000);
         assertEq(pool.deposits(BOB), 30_000_000);
+        _assertAccounting(pool, 130_000_000, 130_000_000, 100_000_000, 30_000_000);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.allowance(BOB, address(pool)), 0);
         assertEq(token.totalSupply(), 230_000_000);
@@ -128,6 +141,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(ALICE), 199_999_999);
         assertEq(token.balanceOf(address(pool)), 1);
         assertEq(pool.deposits(ALICE), 1);
+        _assertAccounting(pool, 1, 1, 1, 0);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
     }
@@ -135,6 +149,7 @@ contract LendingPoolTest is Test {
     /// @notice 기존 예치가 있어도 0 공급을 거절하고 토큰·승인·기록을 보존한다.
     function test_ZeroSupplyRevertsWithoutChangingState() public {
         _approveAndSupply(token, pool, ALICE, 40_000_000);
+        _assertAccounting(pool, 40_000_000, 40_000_000, 40_000_000, 0);
         vm.prank(ALICE);
         token.approve(address(pool), 100_000_000);
         SupplyState memory beforeSupply = _snapshot(token, pool);
@@ -149,6 +164,7 @@ contract LendingPoolTest is Test {
     /// @notice 승인만 부족하면 정확한 승인 오류로 거절하고 기존 예치·승인을 보존한다.
     function test_InsufficientAllowanceRevertsWithoutChangingState() public {
         _approveAndSupply(token, pool, ALICE, 40_000_000);
+        _assertAccounting(pool, 40_000_000, 40_000_000, 40_000_000, 0);
         token.mint(ALICE, 40_000_000);
         vm.prank(ALICE);
         token.approve(address(pool), 99_000_000);
@@ -168,6 +184,7 @@ contract LendingPoolTest is Test {
     /// @notice 승인을 먼저 차감하더라도 잔고 부족으로 실패하면 승인 100까지 복구된다.
     function test_InsufficientBalanceRestoresSpentAllowanceAndExistingDeposit() public {
         _approveAndSupply(token, pool, ALICE, 101_000_000);
+        _assertAccounting(pool, 101_000_000, 101_000_000, 101_000_000, 0);
         vm.prank(ALICE);
         token.approve(address(pool), 100_000_000);
         SupplyState memory beforeSupply = _snapshot(token, pool);
@@ -241,6 +258,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(ALICE), 190_000_000);
         assertEq(token.balanceOf(address(pool)), 10_000_000);
         assertEq(pool.deposits(ALICE), 0);
+        _assertAccounting(pool, 0, 0, 0, 0);
         assertEq(pool.deposits(BOB), 0);
         assertEq(token.totalSupply(), 200_000_000);
         _assertNoSupplyEvent(donationLogs, address(pool));
@@ -251,6 +269,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(address(pool)), 110_000_000);
         assertEq(pool.deposits(ALICE), 100_000_000);
         assertEq(pool.deposits(BOB), 0);
+        _assertAccounting(pool, 100_000_000, 100_000_000, 100_000_000, 0);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
     }
@@ -267,6 +286,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(address(pool)), 50_000_000);
         assertEq(pool.deposits(ALICE), 40_000_000);
         assertEq(pool.deposits(BOB), 0);
+        _assertAccounting(pool, 40_000_000, 40_000_000, 40_000_000, 0);
         assertEq(token.totalSupply(), 210_000_000);
         _assertNoSupplyEvent(logs, address(pool));
     }
@@ -282,6 +302,8 @@ contract LendingPoolTest is Test {
         reentrantToken.approve(address(reentrantPool), 100_000_000);
         assertEq(reentrantToken.balanceOf(address(reentrantToken)), 1);
         assertEq(reentrantToken.allowance(address(reentrantToken), address(reentrantPool)), 1);
+        _assertAccounting(reentrantPool, 0, 0, 0, 0);
+        assertEq(reentrantPool.shares(address(reentrantToken)), 0);
 
         vm.recordLogs();
         vm.prank(ALICE);
@@ -296,8 +318,10 @@ contract LendingPoolTest is Test {
         assertEq(reentrantToken.balanceOf(ALICE), 100_000_000);
         assertEq(reentrantToken.balanceOf(address(reentrantPool)), 100_000_000);
         assertEq(reentrantPool.deposits(ALICE), 100_000_000);
+        _assertAccounting(reentrantPool, 100_000_000, 100_000_000, 100_000_000, 0);
         assertEq(reentrantToken.allowance(ALICE, address(reentrantPool)), 0);
         assertEq(reentrantPool.deposits(address(reentrantToken)), 0);
+        assertEq(reentrantPool.shares(address(reentrantToken)), 0);
         assertEq(reentrantToken.balanceOf(address(reentrantToken)), 1);
         assertEq(reentrantToken.allowance(address(reentrantToken), address(reentrantPool)), 1);
         assertEq(reentrantToken.balanceOf(BOB), 0);
@@ -309,9 +333,15 @@ contract LendingPoolTest is Test {
     /// @notice 승인 소진 후에도 40 출금은 토큰·예치·이벤트에 한 번 반영되고 총발행량은 유지된다.
     function test_WithdrawMovesTokensAndDebitsOnlyCallerWithoutNewApproval() public {
         _approveAndSupply(token, pool, ALICE, 100_000_000);
+        assertEq(token.balanceOf(BOB), 0);
+        assertEq(pool.shares(BOB), 0);
+        assertEq(pool.deposits(BOB), 0);
         assertEq(token.balanceOf(ALICE), 100_000_000);
         assertEq(token.balanceOf(address(pool)), 100_000_000);
         assertEq(pool.deposits(ALICE), 100_000_000);
+        assertEq(pool.totalAssets(), 100_000_000);
+        assertEq(pool.totalShares(), 100_000_000);
+        assertEq(pool.shares(ALICE), 100_000_000);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
 
@@ -323,6 +353,10 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(ALICE), 140_000_000);
         assertEq(token.balanceOf(address(pool)), 60_000_000);
         assertEq(pool.deposits(ALICE), 60_000_000);
+        assertEq(pool.totalAssets(), 60_000_000);
+        assertEq(pool.totalShares(), 60_000_000);
+        assertEq(pool.shares(ALICE), 60_000_000);
+        assertEq(pool.shares(BOB), 0);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
         assertEq(token.balanceOf(BOB), 0);
@@ -335,6 +369,7 @@ contract LendingPoolTest is Test {
         _approveAndSupply(token, pool, ALICE, 100_000_000);
         vm.prank(ALICE);
         pool.withdraw(40_000_000);
+        _assertAccounting(pool, 60_000_000, 60_000_000, 60_000_000, 0);
 
         vm.recordLogs();
         vm.prank(ALICE);
@@ -343,6 +378,7 @@ contract LendingPoolTest is Test {
 
         assertEq(token.balanceOf(ALICE), 160_000_000);
         assertEq(pool.deposits(ALICE), 40_000_000);
+        _assertAccounting(pool, 40_000_000, 40_000_000, 40_000_000, 0);
         assertEq(token.balanceOf(address(pool)), 40_000_000);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
@@ -357,6 +393,7 @@ contract LendingPoolTest is Test {
 
         assertEq(token.balanceOf(ALICE), 200_000_000);
         assertEq(pool.deposits(ALICE), 0);
+        _assertAccounting(pool, 0, 0, 0, 0);
         assertEq(token.balanceOf(address(pool)), 0);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
@@ -369,6 +406,7 @@ contract LendingPoolTest is Test {
         pool.withdraw(40_000_000);
         assertEq(pool.deposits(ALICE), 60_000_000);
         assertEq(token.balanceOf(address(pool)), 60_000_000);
+        _assertAccounting(pool, 60_000_000, 60_000_000, 60_000_000, 0);
 
         vm.prank(ALICE);
         pool.withdraw(60_000_000);
@@ -377,6 +415,7 @@ contract LendingPoolTest is Test {
         assertEq(pool.deposits(ALICE), 0);
         assertEq(token.balanceOf(address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
+        _assertAccounting(pool, 0, 0, 0, 0);
     }
 
     /// @notice 최소 단위 1의 출금은 반올림 없이 토큰·예치·현금에 반영한다.
@@ -387,6 +426,7 @@ contract LendingPoolTest is Test {
 
         assertEq(token.balanceOf(ALICE), 100_000_001);
         assertEq(pool.deposits(ALICE), 99_999_999);
+        _assertAccounting(pool, 99_999_999, 99_999_999, 99_999_999, 0);
         assertEq(token.balanceOf(address(pool)), 99_999_999);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 200_000_000);
@@ -394,6 +434,7 @@ contract LendingPoolTest is Test {
 
     /// @notice 예치와 현금도 0인 상태에서 0 요청은 금액 오류를 우선 반환한다.
     function test_ZeroWithdrawalTakesPriorityWhenDepositAndCashAreZero() public {
+        _assertAccounting(pool, 0, 0, 0, 0);
         SupplyState memory beforeWithdrawal = _snapshot(token, pool);
 
         vm.expectRevert(bytes4(keccak256("ZeroAmount()")));
@@ -408,6 +449,7 @@ contract LendingPoolTest is Test {
         _approveAndSupply(token, pool, ALICE, 100_000_000);
         vm.prank(ALICE);
         pool.withdraw(40_000_000);
+        _assertAccounting(pool, 60_000_000, 60_000_000, 60_000_000, 0);
         vm.prank(ALICE);
         token.approve(address(pool), 7);
         vm.prank(BOB);
@@ -426,6 +468,7 @@ contract LendingPoolTest is Test {
         _approveAndSupply(token, pool, ALICE, 100_000_000);
         vm.prank(ALICE);
         pool.withdraw(40_000_000);
+        _assertAccounting(pool, 60_000_000, 60_000_000, 60_000_000, 0);
         SupplyState memory beforeWithdrawal = _snapshot(token, pool);
 
         vm.expectRevert(abi.encodeWithSignature("InsufficientDeposit(uint256,uint256)", 60_000_000, 61_000_000));
@@ -443,6 +486,7 @@ contract LendingPoolTest is Test {
         assertEq(pool.deposits(ALICE), 100_000_000);
         assertEq(token.balanceOf(address(pool)), 50_000_000);
         assertEq(token.totalSupply(), 150_000_000);
+        _assertAccounting(pool, 100_000_000, 100_000_000, 100_000_000, 0);
         SupplyState memory beforeWithdrawal = _snapshot(token, pool);
 
         vm.expectRevert(abi.encodeWithSignature("InsufficientLiquidity(uint256,uint256)", 50_000_000, 60_000_000));
@@ -459,12 +503,14 @@ contract LendingPoolTest is Test {
         assertEq(token.totalSupply(), 150_000_000);
         assertEq(pool.deposits(ALICE), 100_000_000);
         assertEq(token.balanceOf(address(pool)), 50_000_000);
+        _assertAccounting(pool, 100_000_000, 100_000_000, 100_000_000, 0);
 
         vm.prank(ALICE);
         pool.withdraw(50_000_000);
 
         assertEq(token.balanceOf(ALICE), 150_000_000);
         assertEq(pool.deposits(ALICE), 50_000_000);
+        _assertAccounting(pool, 50_000_000, 50_000_000, 50_000_000, 0);
         assertEq(token.balanceOf(address(pool)), 0);
         assertEq(token.allowance(ALICE, address(pool)), 0);
         assertEq(token.totalSupply(), 150_000_000);
@@ -473,6 +519,7 @@ contract LendingPoolTest is Test {
     /// @notice Bob은 풀에 현금이 있어도 Alice의 예치를 자기 출금 권리로 사용할 수 없다.
     function test_WithdrawalWithoutOwnDepositPreservesOtherUserFunds() public {
         _approveAndSupply(token, pool, ALICE, 100_000_000);
+        _assertAccounting(pool, 100_000_000, 100_000_000, 100_000_000, 0);
         SupplyState memory beforeWithdrawal = _snapshot(token, pool);
 
         vm.expectRevert(abi.encodeWithSelector(LendingPool.InsufficientDeposit.selector, 0, 1_000_000));
@@ -500,6 +547,7 @@ contract LendingPoolTest is Test {
         assertEq(token.balanceOf(BOB), 0);
         assertEq(pool.deposits(BOB), 30_000_000);
         assertEq(token.balanceOf(address(pool)), 90_000_000);
+        _assertAccounting(pool, 90_000_000, 90_000_000, 60_000_000, 30_000_000);
         assertEq(token.allowance(ALICE, address(pool)), 7);
         assertEq(token.allowance(BOB, address(pool)), 9);
         assertEq(token.totalSupply(), 230_000_000);
@@ -523,6 +571,7 @@ contract LendingPoolTest is Test {
 
     /// @dev 직접 유입 후 상태를 먼저 고정하고 Bob의 정확한 오류와 전체 상태 보존을 대조한다.
     function _assertUncreditedBobCannotWithdraw() private {
+        _assertAccounting(pool, 100_000_000, 100_000_000, 100_000_000, 0);
         assertEq(token.balanceOf(ALICE), 100_000_000);
         assertEq(pool.deposits(ALICE), 100_000_000);
         assertEq(pool.deposits(BOB), 0);
@@ -575,6 +624,7 @@ contract LendingPoolTest is Test {
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(failurePool.deposits(ALICE), 60_000_000);
+        _assertAccounting(failurePool, 60_000_000, 60_000_000, 60_000_000, 0);
         assertEq(failureToken.balanceOf(ALICE), 140_000_000);
         assertEq(failureToken.balanceOf(address(failurePool)), 60_000_000);
         assertEq(failureToken.allowance(ALICE, address(failurePool)), 7);
@@ -609,6 +659,7 @@ contract LendingPoolTest is Test {
         assertEq(failurePool.deposits(ALICE), 100_000_000);
         assertEq(failureToken.balanceOf(ALICE), 100_000_000);
         assertEq(failureToken.balanceOf(address(failurePool)), 100_000_000);
+        _assertAccounting(failurePool, 100_000_000, 100_000_000, 100_000_000, 0);
     }
 
     /// @notice 공급 중 예치가 있는 토큰 주소의 중첩 출금을 거절하고 바깥 공급만 반영한다.
@@ -629,6 +680,10 @@ contract LendingPoolTest is Test {
 
         _assertRejectedCrossCall(callbackToken, callbackPool, 100_000_000, 100_000_000, 100_000_001);
         assertEq(callbackToken.observedDeposit(), 0);
+        assertEq(callbackToken.observedAssets(), 1);
+        assertEq(callbackToken.observedTotalShares(), 1);
+        assertEq(callbackToken.observedShares(), 0);
+        assertEq(callbackToken.observedOwnShares(), 1);
         _assertOneSupplyEvent(logs, address(callbackPool), ALICE, 100_000_000);
         _assertNoWithdrawalEvent(logs, address(callbackPool));
     }
@@ -653,6 +708,10 @@ contract LendingPoolTest is Test {
 
         _assertRejectedCrossCall(callbackToken, callbackPool, 140_000_000, 60_000_000, 60_000_001);
         assertEq(callbackToken.observedDeposit(), 60_000_000);
+        assertEq(callbackToken.observedAssets(), 60_000_001);
+        assertEq(callbackToken.observedTotalShares(), 60_000_001);
+        assertEq(callbackToken.observedShares(), 60_000_000);
+        assertEq(callbackToken.observedOwnShares(), 1);
         _assertOneWithdrawalEvent(logs, address(callbackPool), ALICE, 40_000_000);
         _assertNoSupplyEvent(logs, address(callbackPool));
     }
@@ -677,6 +736,10 @@ contract LendingPoolTest is Test {
 
         _assertRejectedCrossCall(callbackToken, callbackPool, 140_000_000, 60_000_000, 60_000_001);
         assertEq(callbackToken.observedDeposit(), 60_000_000);
+        assertEq(callbackToken.observedAssets(), 60_000_001);
+        assertEq(callbackToken.observedTotalShares(), 60_000_001);
+        assertEq(callbackToken.observedShares(), 60_000_000);
+        assertEq(callbackToken.observedOwnShares(), 1);
         _assertOneWithdrawalEvent(logs, address(callbackPool), ALICE, 40_000_000);
         _assertNoSupplyEvent(logs, address(callbackPool));
     }
@@ -705,9 +768,52 @@ contract LendingPoolTest is Test {
         assertFalse(callbackToken.nestedSucceeded());
         assertEq(callbackToken.nestedError().length, 0);
         assertEq(callbackToken.observedDeposit(), 0);
+        assertEq(callbackToken.observedAssets(), 0);
+        assertEq(callbackToken.observedTotalShares(), 0);
+        assertEq(callbackToken.observedShares(), 0);
+        assertEq(callbackToken.observedOwnShares(), 0);
         assertEq(callbackToken.balanceOf(ALICE), 100_000_000);
         assertEq(callbackPool.deposits(ALICE), 100_000_000);
         assertEq(callbackToken.balanceOf(address(callbackPool)), 100_000_001);
+        _assertAccounting(callbackPool, 100_000_001, 100_000_001, 100_000_000, 0);
+    }
+
+    /// @notice transferFrom 뒤 중첩 오류를 전파하면 새 공급의 토큰·유한 승인·회계·관측을 모두 복구한다.
+    function test_PropagatedNestedWithdrawalDuringSupplyRestoresTokensAllowanceAccountingAndCallbackState() public {
+        (CrossReentrantMockUSDC callbackToken, LendingPool callbackPool) = _prepareCrossReentrantPool();
+        _approveAndSupply(callbackToken, callbackPool, ALICE, 40_000_000);
+        vm.prank(ALICE);
+        callbackToken.approve(address(callbackPool), 100_000_000);
+        callbackToken.arm(
+            callbackPool,
+            CrossReentrantMockUSDC.CallbackOn.TransferFrom,
+            CrossReentrantMockUSDC.NestedAction.Withdraw,
+            true,
+            ALICE
+        );
+        _assertCallbackOwnRights(callbackToken, callbackPool);
+        _assertAccounting(callbackPool, 40_000_001, 40_000_001, 40_000_000, 0);
+        assertEq(callbackToken.balanceOf(ALICE), 160_000_000);
+        assertEq(callbackToken.balanceOf(address(callbackPool)), 40_000_001);
+        assertEq(callbackPool.deposits(ALICE), 40_000_000);
+        assertEq(callbackToken.allowance(ALICE, address(callbackPool)), 100_000_000);
+        assertEq(callbackToken.totalSupply(), 200_000_002);
+        SupplyState memory beforeSupply = _snapshot(callbackToken, callbackPool);
+
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        vm.prank(ALICE);
+        callbackPool.supply(100_000_000);
+
+        _assertStateUnchanged(callbackToken, callbackPool, beforeSupply);
+        _assertCallbackOwnRights(callbackToken, callbackPool);
+        assertFalse(callbackToken.attempted());
+        assertFalse(callbackToken.nestedSucceeded());
+        assertEq(callbackToken.nestedError().length, 0);
+        assertEq(callbackToken.observedDeposit(), 0);
+        assertEq(callbackToken.observedAssets(), 0);
+        assertEq(callbackToken.observedTotalShares(), 0);
+        assertEq(callbackToken.observedShares(), 0);
+        assertEq(callbackToken.observedOwnShares(), 0);
     }
 
     /// @dev 콜백 없이 자체 정상 예치 1을 만들고 중첩 공급용 잔고도 1 남긴다.
@@ -721,15 +827,19 @@ contract LendingPoolTest is Test {
         callbackToken.mint(address(callbackToken), 2);
         callbackToken.prepareOwnDeposit(callbackPool);
         assertEq(callbackPool.deposits(address(callbackToken)), 1);
+        assertEq(callbackPool.shares(address(callbackToken)), 1);
+        _assertAccounting(callbackPool, 1, 1, 0, 0);
         assertEq(callbackToken.balanceOf(address(callbackToken)), 1);
         assertEq(callbackToken.balanceOf(address(callbackPool)), 1);
         assertFalse(callbackToken.attempted());
     }
 
-    /// @dev 방어가 없어도 중첩 호출의 금액·예치·잔고·승인 조건이 만족하는지 확인한다.
+    /// @dev 잠금 외의 부족 오류가 원인이 되지 않도록 중첩 요청 1의 지분·권리·현금·승인을 확인한다.
     function _assertCallbackOwnRights(CrossReentrantMockUSDC callbackToken, LendingPool callbackPool) private view {
         assertEq(callbackToken.balanceOf(address(callbackToken)), 1);
         assertEq(callbackPool.deposits(address(callbackToken)), 1);
+        assertEq(callbackPool.shares(address(callbackToken)), 1);
+        assertGe(callbackToken.balanceOf(address(callbackPool)), 1);
         assertEq(callbackToken.allowance(address(callbackToken), address(callbackPool)), 1);
     }
 
@@ -748,6 +858,7 @@ contract LendingPoolTest is Test {
         );
         assertEq(callbackToken.balanceOf(ALICE), aliceBalance);
         assertEq(callbackPool.deposits(ALICE), aliceDeposit);
+        _assertAccounting(callbackPool, poolBalance, poolBalance, aliceDeposit, 0);
         assertEq(callbackToken.balanceOf(address(callbackPool)), poolBalance);
         assertEq(callbackToken.allowance(ALICE, address(callbackPool)), 0);
         assertEq(callbackToken.balanceOf(BOB), 0);
@@ -788,6 +899,7 @@ contract LendingPoolTest is Test {
         failurePool = new LendingPool(failureToken);
         failureToken.mint(ALICE, 200_000_000);
         _approveAndSupply(failureToken, failurePool, ALICE, 40_000_000);
+        _assertAccounting(failurePool, 40_000_000, 40_000_000, 40_000_000, 0);
         vm.prank(ALICE);
         failureToken.approve(address(failurePool), 100_000_000);
     }
@@ -800,7 +912,7 @@ contract LendingPoolTest is Test {
         vm.stopPrank();
     }
 
-    /// @dev 실패 직전의 이미 성공한 예치와 별도 승인까지 비교 기준으로 보관한다.
+    /// @dev 이미 성공한 회계·토큰 상태와 별도 승인을 기본 12개 비교 기준으로 보관한다.
     function _snapshot(MockUSDC currentToken, LendingPool currentPool) private view returns (SupplyState memory) {
         return SupplyState({
             aliceBalance: currentToken.balanceOf(ALICE),
@@ -810,11 +922,15 @@ contract LendingPoolTest is Test {
             bobDeposit: currentPool.deposits(BOB),
             allowance: currentToken.allowance(ALICE, address(currentPool)),
             bobAllowance: currentToken.allowance(BOB, address(currentPool)),
-            totalSupply: currentToken.totalSupply()
+            totalSupply: currentToken.totalSupply(),
+            accountedAssets: currentPool.totalAssets(),
+            totalShares: currentPool.totalShares(),
+            aliceShares: currentPool.shares(ALICE),
+            bobShares: currentPool.shares(BOB)
         });
     }
 
-    /// @dev 단순 오류 발생과 구분해 호출 직전의 잔고·예치·양쪽 승인·총량을 확인한다.
+    /// @dev 정확한 오류 확인에 더해 호출 전의 자산·지분·환산권리·토큰·승인 12개를 비교한다.
     function _assertStateUnchanged(MockUSDC currentToken, LendingPool currentPool, SupplyState memory beforeSupply)
         private
         view
@@ -827,6 +943,24 @@ contract LendingPoolTest is Test {
         assertEq(currentToken.allowance(ALICE, address(currentPool)), beforeSupply.allowance);
         assertEq(currentToken.allowance(BOB, address(currentPool)), beforeSupply.bobAllowance);
         assertEq(currentToken.totalSupply(), beforeSupply.totalSupply);
+        assertEq(currentPool.totalAssets(), beforeSupply.accountedAssets);
+        assertEq(currentPool.totalShares(), beforeSupply.totalShares);
+        assertEq(currentPool.shares(ALICE), beforeSupply.aliceShares);
+        assertEq(currentPool.shares(BOB), beforeSupply.bobShares);
+    }
+
+    /// @dev 현금·환산권리와 별개로 인정자산·총지분·두 사용자의 원시 지분을 고정 기대값과 비교한다.
+    function _assertAccounting(
+        LendingPool currentPool,
+        uint256 accountedAssets,
+        uint256 totalShares,
+        uint256 aliceShares,
+        uint256 bobShares
+    ) private view {
+        assertEq(currentPool.totalAssets(), accountedAssets);
+        assertEq(currentPool.totalShares(), totalShares);
+        assertEq(currentPool.shares(ALICE), aliceShares);
+        assertEq(currentPool.shares(BOB), bobShares);
     }
 
     /// @dev 직접 전송·발행의 Transfer 로그를 공급 이벤트로 잘못 세지 않는다.

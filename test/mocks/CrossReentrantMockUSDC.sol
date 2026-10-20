@@ -30,6 +30,14 @@ contract CrossReentrantMockUSDC is MockUSDC {
     bytes public nestedError;
     /// @notice 중첩 호출 직전에 관측한 지정 사용자의 예치 기록이다.
     uint256 public observedDeposit;
+    /// @notice 실제 토큰 전송 후 중첩 호출 직전의 인정자산이다.
+    uint256 public observedAssets;
+    /// @notice 같은 관측 시점의 내부 총지분이다.
+    uint256 public observedTotalShares;
+    /// @notice 같은 관측 시점의 지정 사용자 지분이다.
+    uint256 public observedShares;
+    /// @notice 중첩 호출자인 토큰 주소 자체의 지분이다.
+    uint256 public observedOwnShares;
 
     bool private _armed;
     CallbackOn private _callbackOn;
@@ -59,6 +67,10 @@ contract CrossReentrantMockUSDC is MockUSDC {
         nestedSucceeded = false;
         delete nestedError;
         observedDeposit = 0;
+        observedAssets = 0;
+        observedTotalShares = 0;
+        observedShares = 0;
+        observedOwnShares = 0;
         _approve(address(this), address(pool), 1);
         _armed = true;
     }
@@ -79,13 +91,17 @@ contract CrossReentrantMockUSDC is MockUSDC {
         return transferred;
     }
 
-    /// @notice 재귀를 먼저 막고 예치 기록을 관측한 뒤 최소 단위 1을 재호출한다.
+    /// @notice 재귀를 먼저 막고 전송 후 자산·지분·환산권리를 관측한 뒤 최소 단위 1을 재호출한다.
     /// @dev 오류 전파 모드는 원본 바이트를 그대로 revert하여 모형 상태까지 복구한다.
     function _attemptCallback() private {
         if (attempted) return;
         attempted = true;
         _armed = false;
         observedDeposit = targetPool.deposits(_observedUser);
+        observedAssets = targetPool.totalAssets();
+        observedTotalShares = targetPool.totalShares();
+        observedShares = targetPool.shares(_observedUser);
+        observedOwnShares = targetPool.shares(address(this));
 
         bytes memory callData = _nestedAction == NestedAction.Supply
             ? abi.encodeCall(LendingPool.supply, (1))
