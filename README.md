@@ -7,7 +7,8 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#7](https://github.com/0Chord/lending-protocol/issues/7)의 지분 환산 계산과
 [#8](https://github.com/0Chord/lending-protocol/issues/8)의 공급·출금·조회 연결과
 [#11](https://github.com/0Chord/lending-protocol/issues/11)의 테스트용 MockWBTC와
-[#12](https://github.com/0Chord/lending-protocol/issues/12)의 Mock 가격·담보 가치/한도 계산이다. 테스트 전용 로컬 학습 프로젝트다.
+[#12](https://github.com/0Chord/lending-protocol/issues/12)의 Mock 가격·담보 가치/한도 계산과
+[#13](https://github.com/0Chord/lending-protocol/issues/13)의 본인 WBTC 담보 입금·반환이다. 테스트 전용 로컬 학습 프로젝트다.
 
 ## 실행 환경
 
@@ -24,6 +25,9 @@ forge test --match-contract LendingPoolSharesTest -vv
 forge test --match-contract ShareMathTest -vv
 forge test --match-contract CollateralMathTest -vv
 forge test --match-contract CollateralPriceSourceTest -vv
+forge test --match-contract LendingPoolCollateralTest -vv
+forge test --match-contract LendingPoolCollateralFailureTest -vv
+forge test --match-contract LendingPoolCollateralReentrancyTest -vv
 forge test
 ```
 
@@ -36,7 +40,7 @@ forge test
 | EVM 대상 | `cancun` |
 | forge-std | `v1.16.1`, `620536fa5277db4e3fd46772d5cbc1ea0696fb43` |
 | OpenZeppelin Contracts | `v5.7.0`, `cab19933c33c2ad1d4c7a84864a3601dddfd16f3` |
-| 검증에 사용한 Foundry | `1.6.0-v1.7.0`, commit `f83bad912a9dba7bf0371def1e70bb1896048356` |
+| Foundry (로컬·CI) | 공식 릴리스 `v1.7.0`, commit `f83bad912a9dba7bf0371def1e70bb1896048356` |
 
 컴파일러·EVM 대상·import 연결은 [foundry.toml](foundry.toml)에 있다.
 서브모듈의 Git 고정 커밋과 [foundry.lock](foundry.lock)에 같은 의존성 커밋을 기록한다.
@@ -46,10 +50,120 @@ forge-std는 현재 설치된 Foundry에서 사용할 조합으로 고정했다.
 [v1.17.0 릴리스](https://github.com/foundry-rs/forge-std/releases/tag/v1.17.0)는 새 `Vm.Gas` 구조 때문에 Foundry v1.8.3 이상을 권고한다.
 EVM 대상은 컴파일러 기본값 변화에 영향을 받지 않도록 명시했다.
 
-## 이번에 읽을 동작: Mock 가격으로 담보 가치와 한도를 계산한다
+## PR 자동 검사
+
+[Foundry CI](.github/workflows/test.yml)는 main으로 향하는 PR의 생성·새 커밋·재개와
+main에 커밋이 반영될 때 실행한다. Ubuntu 24.04에서 고정된 서브모듈을 복원하고
+Foundry `v1.7.0`을 설치한 뒤 아래 검사를 순서대로 수행한다.
+
+1. `forge fmt --check`: Solidity 형식 검사
+2. `forge build`: 계약과 테스트 컴파일
+3. `forge test -vv`: 전체 테스트 실행
+
+형식·빌드·테스트 중 하나라도 실패하면 해당 검사 작업이 실패한다.
+테스트는 `src/`의 실제 계약을 테스트 EVM에 배포해 호출하며, 지갑·RPC 비밀값은 필요하지 않다.
+PR의 Checks 탭에서 단계별 결과와 실패한 테스트 이름을 확인할 수 있다.
+CI 설정은 이 PR 변경에 포함하며, GitHub 실행 결과는 게시 후 별도로 확인한다.
+
+## 이번에 읽을 동작: WBTC를 맡기고 본인 기록만큼 돌려받는다
+
+#13은 **WBTC 보관과 반환 권리**를 기존 USDC 공급 지분과 분리한다.
+풀의 생성자는 `new LendingPool(usdc, wbtc)`로 두 자산을 고정한다.
+가격·부채·대출은 아직 연결하지 않았고, 담보 입금만으로 USDC를 받거나 공급 지분이 생기지는 않는다.
+
+먼저 [LendingPoolCollateralTest](test/LendingPoolCollateral.t.sol)의
+`test_DepositMovesWBTCAndCreditsOnlyCaller`와 `test_PartialAndFullReturnNeedNoNewApproval`을 읽는다.
+Alice가 100 USDC를 정상 공급하고 Bob에게 2 WBTC를 발행한 준비에서 시작한다.
+
+| 실행 | Bob 지갑 WBTC | 풀 WBTC | Bob 담보 기록 | Alice USDC 권리 / 풀 USDC |
+| --- | ---: | ---: | ---: | ---: |
+| 입금 전 | 2 | 0 | 0 | 100 / 100 |
+| Bob이 1 WBTC 승인 후 입금 | 1 | 1 | 1 | 100 / 100 |
+| 새 승인 없이 0.4 WBTC 반환 | 1.4 | 0.6 | 0.6 | 100 / 100 |
+| 남은 0.6 WBTC 반환 | 2 | 0 | 0 | 100 / 100 |
+
+위 표는 사람이 읽는 수량이다. WBTC 1은 raw `100_000_000`이고 0.4는 `40_000_000`이다.
+USDC 100도 raw `100_000_000`이지만 단위는 USDC6이며 서로 다른 자산이다.
+정상 입금은 승인량 중 요청한 수량만 소비하고, 반환은 승인을 소비하지 않는다.
+무제한 승인은 고정 OpenZeppelin ERC20 규칙대로 max가 유지된다.
+
+### 실제 토큰 이동과 담보 기록은 어떻게 연결되나
+
+[LendingPool](src/LendingPool.sol)의 `depositCollateral`은 0을 거절한 뒤 다음 순서로 실행한다.
+
+```solidity
+collateralAsset.safeTransferFrom(msg.sender, address(this), amount);
+_collateralBalances[msg.sender] += amount;
+```
+
+첫 줄이 승인된 WBTC를 실제로 받은 다음 두 번째 줄이 외부 호출자의 담보 기록을 늘린다.
+`collateralOf(user)`는 그 기록을 원시 수량으로 돌려준다. 추가 입금도 덮어쓰지 않고 누적한다.
+`withdrawCollateral`은 0·본인 기록 초과를 거절한 뒤 기록을 먼저 줄이고 본인에게 전송한다.
+정확한 기록량의 반환은 허용하고, 기록이 없는 다른 사용자는 풀에 WBTC가 충분해도 반환받지 못한다.
+
+전송 실패가 바깥 호출까지 전파되면 그 호출에서의 상태 변화는 모두 되돌아간다.
+예를 들어 담보1에서0.4를 반환하려고 기록을0.6으로 줄였어도 전송이 실패하면 기록은1로 돌아온다.
+이미 별도 거래로 끝난 approve나 과거 입금까지 취소한다는 의미는 아니다.
+
+### 검토할 전체 흐름
+
+| 흐름 | 동작·거절·보존 | 코드와 검증 |
+| --- | --- | --- |
+| 두 자산 배포 | asset/collateralAsset을 입력 주소로 고정. 각 0/코드 없음·같은 계약 거절 | LendingPool 생성자, 기존 USDC 배포 거절 회귀와 담보 테스트의 Constructor 사례 |
+| 본인 입금·추가 입금·조회 | 실제 수령 뒤 기록 증가. 양수 최소 단위1도 그대로 처리 | depositCollateral/collateralOf, 담보 테스트의 Deposit·AdditionalDeposits 사례 |
+| 본인 부분/전액 반환 | 기록 선차감 뒤 본인에게 요청량 지급. 새 승인 없이 가능 | withdrawCollateral, PartialAndFullReturn·ReturnsOneSmallestUnit·ReturnKeeps 사례 |
+| 0·승인·권리 거절 | 0을 우선 거절하고 승인 부족·본인 기록 초과의 정확한 인수 비교 | 담보 테스트의 Zero·InsufficientAllowance·AboveOwnRecord 사례 |
+| 담보/USDC 분리·직접 유입 | 담보는 USDC 잔고/지분을, USDC 동작은 0이 아닌 담보 기록을 보존. 직접 송금/발행은 기록 권리를 만들지 않음 | USDCSupplyAndWithdrawalPreserveNonzeroCollateral·DirectTransfer·DirectMint 사례 |
+| 전송·잔고·산술 실패 | 실제 이동 후 false/revert·잔고 부족·시험 장부 overflow에서 토큰/승인/기록 복구. 장애 해제 후 동일 재시도 | [담보 실패 테스트](test/LendingPoolCollateralFailure.t.sol), [WBTC 실패 대역](test/mocks/FailingMockWBTC.sol) |
+| 담보/USDC의 공통 잠금 | 네 진입점이 같은 잠금 사용. 중첩 오류를 잡으면 바깥1회, 전파하면 바깥도 복구 | [교차 재진입 테스트](test/LendingPoolCollateralReentrancy.t.sol), [두 토큰 콜백 대역](test/mocks/CollateralReentrantMocks.sol) |
+
+<details>
+<summary>테스트의 준비·실행·검증문을 따라 읽기</summary>
+
+공통 준비는 [CollateralTestBase](test/helpers/CollateralTestBase.sol)다.
+새 풀에 Alice200 USDC 중100을 정상 공급하고 Bob2 WBTC를 발행한다.
+`_usdcState`는 두 사용자/풀 잔고·승인·발행량·인정자산/총·개인 지분·환산권리12값이다.
+`_state`는 여기에 WBTC 잔고3·승인2·발행량1·개인 담보2를 더한20값을 비교한다.
+콜백 토큰 자신의 양 자산 잔고·승인·공급 지분/권리·담보7값도 별도로 관측한다.
+정상 이벤트는 풀 emitter·외부 호출자·이번 요청량·정확히1회인지 확인하고 토큰 Transfer와 구분한다.
+
+| 테스트 묶음 | 준비와 실행 | 실제 확인하는 결과 |
+| --- | --- | --- |
+| 첫 입금·추가 입금·사용자 분리 | Bob1 입금 뒤0.2 추가, Alice는 별도0.3 입금 | Bob 기록1.2·Alice0.3, 풀1.5·발행량2.3 WBTC. 추가 이벤트는 이번0.2, USDC12값 유지 |
+| 부분/전액·최소 단위·승인 정책 | Bob1 입금 뒤0.4/0.6 반환. 별도 raw1 왕복, 유한/무제한 승인 대조 | 지갑/풀/기록을 위 고정표와 비교. 입금은 유한 승인 소비·max 유지, 반환은 승인 유지 |
+| 배포·0·권리·승인 거절 | 다른 입력은 정상으로 두고 0/코드 없는 담보·같은 계약, 0 요청·기록보다1 많은 반환·승인1 부족을 각각 호출 | 각 오류와 전체 인수, 호출 직전20값 보존·풀 성공 이벤트0회. 권리 부족은 충분한 풀 WBTC를 별도로 준비 |
+| 양방향 장부 분리 | Alice도 담보를 가진 채 USDC10 추가 공급 후10 출금 | 중간 USDC 권리110·마지막100. 각 동작에서0이 아닌 Alice/Bob 담보·WBTC잔고/승인/발행량은 유지 |
+| 직접 transfer / mint | 정상 담보1 뒤 풀에0.2 직접 유입, 정상1 전액 반환 | 본인·타인 기록 불변, 기록0 뒤 풀0.2만 남음. 추가1 raw 반환은 권리 오류. transfer의 발행량 유지와 mint의 증가를 별도 비교 |
+| raw false 대조2개 | 풀을 거치지 않고 실패 대역의 실제 transferFrom/transfer를 직접 실행 | false여도 잔고 이동이 실제 남고 transferFrom만 유한 승인 소비. 담보 기록은0 |
+| 풀 실패4종과 재시도 | Bob담보1·Alice0.3, 양 자산 승인 준비. 입금0.2 또는 반환0.4의 전송 뒤 false/revert, 장애를 끈 뒤 같은 요청 재시도 | SafeERC20 오류/원본 오류·20값 복구. 재시도는 요청1회·이벤트1회; 입금 승인0.8→0.6, 반환 승인0.8 유지 |
+| Bob 잔고 부족 |1.39 발행 후0.4 입금, 새 승인1로 추가1 입금 시도 | 잔고0.99의 정확한 오류, 승인1·기존 담보0.4 복구 |
+| 풀 실제 잔고 부족·복원 | 정상1 입금 후 시험에서만 풀 현금을0.5로 줄임.0.6 반환 실패 뒤0.5 재발행하고 재시도 | 조정 발행량1.5와 기존 기록1 보존. 복원 후 Bob1.6·풀/기록0.4·발행량2 |
+| 담보 합산 overflow | 시험 전용 하네스에서 Bob 기록max, 잔고/승인 raw1로 입금 | 실제 전송 뒤 Panic(0x11), 토큰·승인·기록·USDC20값 복구. 일반 풀에는 장부 setter 없음 |
+| 공통 잠금8경로 | 담보 입금/반환끼리와 USDC 공급/출금의 대표 양방향, 자기 경로 재호출 | 토큰 주소의 정상 공급/담보 권리1·각 잔고2·유한 승인1을 준비. 중첩 직전에도 충분한 재원인지 확인하고 정확한 잠금 오류·바깥1회 검증 |
+| 전파된 잠금 오류2개 | 실제 담보 입금/반환 전송 뒤 중첩 오류를 바깥에 전파, 콜백을 끈 뒤 같은 요청 재시도 | 20값·토큰 자신의7값·콜백 설정/관측 저장까지 복구. 정상 재시도 성공과 잠금 해제 확인 |
+
+담보 입금 콜백은 기록 증가 전, 반환 콜백은 기록 선차감 후를 관측한다.
+기존1에서0.4 반환 중 관측 기록은0.6이다. 중첩 호출자는 Bob이 아니라 토큰 계약 자신이다.
+이 권리와 잔고를 정상 준비해 잔고 부족 오류를 재진입 방어의 근거로 쓰지 않는다.
+실패 경로는 풀 성공 이벤트가 발생하기 전 중단된다. 수집된 토큰 내부 로그만으로 실제 실패 거래의 영수증 로그를 판단하지 않는다.
+기존 USDC 테스트·지분 하네스의 생성자는 모두 두 인자로 이행했고 기존 기대값은 유지했다.
+
+</details>
+
+현재 담보 테스트는 정상/거절18개·실패9개·재진입10개다.
+기존104개와 함께 전체141개가 통과했고 실패/skip은0개이며 형식 검사·빌드·diff 공백 검사도 통과했다.
+이는 로컬 실행 결과이며 사용자 이해 확인·원격 CI·독립 구현 리뷰의 판정을 대신하지 않는다.
+
+생성자 검사는 주소/코드 존재/서로 다름까지다. 실제 자산 정밀도6/8·가격8 연결 검사와 잘못된 연결 배포 거절은
+[#14](https://github.com/0Chord/lending-protocol/issues/14)에서 도입한다. 임의 ERC20·세금/리베이스 토큰·실제 BTC 보관을 지원한다고 보장하지 않는다.
+이 단계는 부채가 없는 담보 보관이며, #14가 대출·상환과 부채0 반환 조건을 함께 추가한다.
+실제 Chainlink·시장가격·배포는 이번 검증 범위에 포함되지 않는다.
+
+## Mock 가격 계산기를 읽는 순서
 
 #12는 가격과 갱신시각을 검증한 뒤 **WBTC 담보의 USDC 가치와 그 70% 한도**를 계산한다.
-아직 풀에 담보를 맡기거나 대출하지 않는다. 아래 가격은 테스트 입력이며 실제 시장가격이 아니다.
+이 계산기는 풀의 담보 보관과 분리되어 있다. 가격을 대출에 연결하는 작업은 #14 범위다.
+아래 가격은 테스트 입력이며 실제 시장가격이 아니다.
 
 첫 예시는 **1 WBTC·가격 100 USDC → 가치 100 USDC·한도 70 USDC**다.
 테스트는 [CollateralMathTest](test/CollateralMath.t.sol)의 `test_OneWBTCAtOneHundredUSDC`부터 읽는다.
@@ -145,8 +259,8 @@ Mock 원천이 음수나 미래시각을 반환하는 것은 정상 동작이며
 ## MockWBTC를 읽는 순서
 
 #11은 **소수점 8자리 토큰과 테스트 잔고 발행**만 추가한다.
-실제 BTC를 보관하거나 BTC와 교환하는 기능은 없다. 기존 LendingPool은 계속 MockUSDC만 사용한다.
-WBTC 담보 입금·반환은 후속 [#13](https://github.com/0Chord/lending-protocol/issues/13)에서 연결한다.
+실제 BTC를 보관하거나 BTC와 교환하는 기능은 없다. LendingPool은 USDC 공급과 WBTC 담보를 분리한다.
+WBTC 담보 입금·반환은 [#13](https://github.com/0Chord/lending-protocol/issues/13)에서 연결했다.
 
 먼저 [MockWBTC](src/mocks/MockWBTC.sol)의 `decimals()`를 읽고,
 [MockWBTCTest](test/MockWBTC.t.sol)의 `test_DecimalsAreEight`에서 고정값 `8`과 비교하는 검증문을 확인한다.
