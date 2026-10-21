@@ -21,20 +21,20 @@ contract LendingPoolCollateralTest is CollateralTestBase {
     /// @notice 정상 USDC를 전달해 담보 0 주소만의 오류를 확인한다.
     function test_ConstructorRejectsZeroCollateral() public {
         vm.expectRevert(abi.encodeWithSelector(LendingPool.InvalidCollateralAsset.selector, address(0)));
-        new LendingPool(usdc, IERC20(address(0)));
+        new LendingPool(usdc, IERC20(address(0)), priceSource);
     }
 
     /// @notice 정상 USDC와 구분해 코드 없는 담보 주소의 배포를 거절한다.
     function test_ConstructorRejectsCollateralWithoutCode() public {
         assertEq(BOB.code.length, 0);
         vm.expectRevert(abi.encodeWithSelector(LendingPool.InvalidCollateralAsset.selector, BOB));
-        new LendingPool(usdc, IERC20(BOB));
+        new LendingPool(usdc, IERC20(BOB), priceSource);
     }
 
     /// @notice 코드 있는 같은 계약을 두 자산으로 연결하면 주소 구분 오류를 낸다.
     function test_ConstructorRejectsIdenticalAssetContracts() public {
         vm.expectRevert(abi.encodeWithSelector(LendingPool.IdenticalAssets.selector, address(usdc)));
-        new LendingPool(usdc, usdc);
+        new LendingPool(usdc, usdc, priceSource);
     }
 
     /// @notice 1 WBTC 승인 입금은 Bob·풀·기록에만 반영하고 USDC 상태를 보존한다.

@@ -8,7 +8,176 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#8](https://github.com/0Chord/lending-protocol/issues/8)의 공급·출금·조회 연결과
 [#11](https://github.com/0Chord/lending-protocol/issues/11)의 테스트용 MockWBTC와
 [#12](https://github.com/0Chord/lending-protocol/issues/12)의 Mock 가격·담보 가치/한도 계산과
-[#13](https://github.com/0Chord/lending-protocol/issues/13)의 본인 WBTC 담보 입금·반환이다. 테스트 전용 로컬 학습 프로젝트다.
+[#13](https://github.com/0Chord/lending-protocol/issues/13)의 본인 WBTC 담보 입금·반환과
+[#14](https://github.com/0Chord/lending-protocol/issues/14)의 이자 없는 담보대출·상환 연결이다. 테스트 전용 학습 프로젝트다.
+
+## 이번에 읽을 동작: 담보로 빌린 원금을 갚고 담보를 돌려받는다
+
+#14는 **공급 지분·WBTC 담보·USDC 원금 부채를 별도로 기록**한다. 공급자는 `supply`로 지분을 받고,
+차입자는 `depositCollateral`로 담보를 맡긴 뒤 `borrow`로 USDC를 받는다. `repay`는 본인 원금만 줄이며,
+부채가 0이 된 뒤 `withdrawCollateral`을 별도로 호출해야 담보가 돌아온다.
+
+아래는 #13 병합본 `a1fcd9b`에 추가한 대출·상환의 실제 함수와 검증문을 읽기 위한 안내다.
+정상 대출·상환부터 배포 연결 검사, 거절 조건, 공통 현금 한도, 전송 실패·재진입 순서로 읽는다.
+대출과 출금의 공통 재원 연결을 포함해 로컬 전체206개가 통과했다. 실행·독립 리뷰·원격 CI 결과는 PR에서 각각 확인한다.
+
+### 먼저 볼 정상 흐름: 40을 빌리고 15와 25를 갚는다
+
+[대출 테스트](test/LendingPoolBorrow.t.sol)의 `test_BorrowFortyMovesCashAndRecordsOnlyDebt`와
+[상환 테스트](test/LendingPoolRepay.t.sol)의 `test_RepayFifteenThenTwentyFiveAndReturnCollateral`부터 읽는다.
+[BorrowTestBase](test/helpers/BorrowTestBase.sol)는 Alice에게 **100 USDC만 발행해 전부 정상 공급**하고,
+Bob은 1 WBTC를 정상 담보 입금한다. Mock 가격은 1 WBTC당 100 USDC, 가격 시각과 현재시각은 모두 10,000초다.
+이 준비는 뒤의 #13 담보 예시(Alice에게 200 USDC 발행)와 다르다.
+
+| 단계 | Bob USDC | 풀 USDC 현금 | Bob / 총부채 | Bob 담보 기록 | Alice 공급 권리 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 정상 공급·담보 입금 완료 | 0 | 100 | 0 / 0 | 1 WBTC | 100 |
+| Bob이 40 대출 | 40 | 60 | 40 / 40 | 1 WBTC | 100 |
+| 유한 승인 15 뒤 15 상환 | 25 | 75 | 25 / 25 | 1 WBTC | 100 |
+| 새 유한 승인 25 뒤 25 상환 | 0 | 100 | 0 / 0 | 1 WBTC | 100 |
+| 새 승인 없이 1 WBTC 반환 | 0 | 100 | 0 / 0 | 0 | 100 |
+
+표의 USDC는 사람이 읽는 단위이며 계약 입력·부채·이벤트는 USDC6 최소 단위다. 40 USDC는 `40_000_000`이다.
+대출은 Bob의 USDC 승인을 요구하지 않는다. 상환은 Bob의 USDC 승인이 필요하고, 위 유한 승인은 각 요청 후 0이다.
+원금 대출·상환 중 인정자산·총지분·Alice 지분은 각각 100을 유지한다. 현금과 받을 원금의 구성이 바뀌는 것이다.
+WBTC 담보를 USDC 인정자산에 더하거나, 차입자의 공급 지분을 부채와 자동으로 상계하지 않는다.
+
+### 실제 입력의 단위를 배포 때 확인한다
+
+현재 생성자는 `new LendingPool(usdc, wbtc, priceSource)`다. 세 주소의 코드와 두 토큰의 구분을 먼저 확인한 뒤,
+**대출 토큰6 → 담보 토큰8 → 가격 원천8** 순서로 각 실제 주소의 `decimals()`를 읽는다.
+[LendingPool](src/LendingPool.sol)의 생성자와 `_checkDecimals`를 읽으면 이 경계를 확인할 수 있다.
+
+| 연결 오류 | 구분할 결과 |
+| --- | --- |
+| 자산/담보/가격 중 하나만 18자리 | `UnsupportedDecimals(해당 주소, 기대 6 또는 8, 실제 18)` |
+| WBTC를 대출 자산에, USDC를 담보에 연결 | 첫 자산 검사에서 `UnsupportedDecimals(WBTC 주소, 6, 8)` |
+| decimals 함수 없음·빈 응답·revert·짧은 ABI·uint8 범위 밖의 raw256 | `InvalidDecimalsMetadata(해당 주소)` |
+| 0 또는 코드 없는 가격 주소 | `InvalidPriceSource(해당 주소)` |
+
+배포에서 `latestPrice()`는 호출하지 않는다. 따라서 가격값이 0이거나 오래되었어도 metadata8 연결은 배포 가능하다.
+항상 가격 조회가 실패하는 원천으로도 배포·공급·담보 입금·부채 없는 반환이 가능해야 한다.
+[정밀도 테스트](test/LendingPoolConfiguration.t.sol)는 정확한 오류와 기존 토큰 잔고·승인·총발행량·원시 가격의 보존,
+배포 중 이벤트 부재, 이후 정상 연결의 배포 성공을 함께 비교한다.
+metadata 검사는 단위 연결 검사이며 토큰 정체나 가격 페어의 진실성, 임의 계약의 향후 정밀도 변경까지 보증하지 않는다.
+
+### 대출·상환·담보 반환이 멈추는 지점
+
+[LendingPool](src/LendingPool.sol)의 `borrow`, `repay`, `withdrawCollateral`을 아래 순서로 읽는다.
+
+| 행동 | 판단 순서 | 성공 시 변경과 외부 호출 |
+| --- | --- | --- |
+| `borrow(amount)` | 0 거절 → 가격·갱신시각 검증 및 70% 총부채 한도 계산 → 본인 기존 부채를 포함한 한도 → 사용 가능 현금 | 개인/총부채 선증가 → 본인에게 USDC 전송 → `Borrowed` 1회 |
+| `repay(amount)` | 0 거절 → 본인 부채를 넘는 요청 전체 거절 | 승인된 USDC를 실제 수령 → 개인/총부채 차감 → `Repaid` 1회 |
+| `withdrawCollateral(amount)` | 0 거절 → 본인 부채0 필수 → 본인 담보 기록 이하 | 담보 기록 선차감 → 본인에게 WBTC 전송 → `CollateralWithdrawn` 1회 |
+| `withdraw(amount)` | 0 거절 → 본인 USDC 환산 권리 → 공통 사용 가능 현금 → 올림 지분·마지막 지분의 잔여자산 검사 | 인정자산·총/개인 지분 선차감 → 본인에게 USDC 전송 |
+
+대출 한도는 이번 요청의 한도가 아니라 **기존 부채를 포함한 총부채 한도**다. 담보1·가격100이면 70까지 가능하다.
+40을 빌린 뒤 가격을50으로 낮추면 한도는35가 되어 추가1 최소 단위도 거절한다. 기존 부채40을 지우지는 않는다.
+코드는 `debt > limit || amount > limit - debt`로 비교해 이 상황을 underflow나 요청액 합산 overflow로 잘못 처리하지 않는다.
+가격0·음수, 시각0·미래, 3601초 이상 지난 가격은 거절하며 정확히3600초는 허용한다. 담보0도 잘못된 가격을 숨기지 않는다.
+
+상환은 유효한 가격을 요구하지 않는다. 부채40에서 지갑·승인을50으로 충분히 준비해도 50상환은
+`RepayExceedsDebt(40_000_000, 50_000_000)`로 전체 거절한다. 초과분을 보관하거나 일부만 받지 않는다.
+이 사례의 추가 mint10 때문에 USDC 총발행량은110이며, 잔고 부족에 우연히 실패한 것을 초과상환 검사로 세지 않는다.
+부채가 남은 담보 반환은 `OutstandingDebt`로 거절하고, 전액 상환 후에도 담보는 반환 요청 전까지 그대로 있다.
+
+가격값과 metadata는 역할이 다르다. metadata는 배포 때만 확인하고, 배포 후에는 **새 `borrow`만 가격값을 읽는다.**
+공급·출금·담보 추가·상환·부채0 담보 반환과 장부·사용 가능 현금 조회는 가격 원천에 의존하지 않는다.
+`test_PriceAndMetadataFailureDoNotBlockPriceIndependentActions`는 정상 대출 뒤 가격 및 세 역할의 metadata 호출이
+실제로 revert하도록 바꾸어 위 동작을 실행한다. 오래된 가격만 놓고 우연히 통과한 사례와 구별한다.
+
+### 직접 유입20은 대출과 출금의 재원이 되지 않는다
+
+C는 풀의 실제 USDC 현금, A는 공급 장부의 인정자산, D는 미상환 총원금, S는 총지분이다.
+정상 장부의 `D <= A`에서 [availableLiquidity](src/LendingPool.sol)는 **`min(C, A - D)`**다.
+풀에 직접 보낸 USDC는 공급 지분을 만들지 않으며, `repay`를 호출하지 않았으므로 부채도 줄이지 않는다.
+대출과 공급자 출금은 이 한도를 함께 사용해 직접 유입을 공급자 재원으로 꺼내 쓰지 않는다.
+
+| 단계 | C 현금 | A 인정자산 | D 총부채 | S / Alice 지분 | 사용 가능 현금 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Alice100 공급 + 직접20 유입 | 120 | 100 | 0 | 100 / 100 | 100 |
+| Bob70 대출 | 50 | 100 | 70 | 100 / 100 | 30 |
+| Alice40 출금 거절 | 50 | 100 | 70 | 100 / 100 | 30 |
+| Alice30 출금 | 20 | 70 | 70 | 70 / 70 | 0 |
+| Bob70 상환 | 90 | 70 | 0 | 70 / 70 | 70 |
+| Alice 나머지70 출금 | 20 | 0 | 0 | 0 / 0 | 0 |
+| 새 공급자 Charlie10 공급 | 30 | 10 | 0 | 10 / 0 | 10 |
+
+[공통 재원 테스트](test/LendingPoolLiquidity.t.sol)의 transfer·mint 두 사례가 이 순서를 각각 실행한다.
+C50·A100·D70에서 출금40은 `InsufficientLiquidity(30_000_000, 40_000_000)`이다.
+Bob의 담보를2 WBTC로 늘려 총부채 한도140을 준비해도 추가 대출40은 같은 재원 오류다.
+담보 한도 부족과 현금 부족을 서로의 검증 근거로 쓰지 않는다.
+
+실제 현금이 장부상 남은30보다 적은10이면 사용할 수 있는 금액도10이다. 이 손실 준비는 테스트의 잔고 조정이며
+A를 자동으로 상각하는 기능이 아니다. D가 A보다 크도록 시험 장부를 주입한 경우에는 `InvalidDebtAccounting(A,D)`를
+발생시켜 잘못된 장부를0현금으로 숨기지 않는다. 정상 풀에는 이 상태를 만들기 위한 setter가 없다.
+
+### 전송 실패와 재진입은 어느 순간을 관측하나
+
+[실패 테스트](test/LendingPoolDebtFailure.t.sol)는 실제 transfer/transferFrom 뒤 false 또는 원본 revert를 발생시킨다.
+대출 실패는 먼저 늘린 개인/총부채와 이미 움직인 토큰을 복구한다. 상환 실패는 토큰 이동·유한 승인 소비·부채를 복구한다.
+장애를 끄고 같은 요청을 다시 실행하면 대출40 또는 상환15가 한 번만 반영된다. 별도 거래로 끝난 approve까지 취소하지 않는다.
+
+[재진입 테스트](test/LendingPoolBorrowReentrancy.t.sol)는 [DebtReentrantMockUSDC](test/mocks/DebtReentrantMockUSDC.sol)가
+실제 토큰 이동을 끝낸 뒤 풀을 다시 호출하게 한다. 중첩 호출자는 Bob이 아니라 토큰 계약 자신이다.
+그 주소에 정상 공급raw1·담보raw2를 만들며, 가격100에서 담보raw2의 한도는 USDC raw1이다.
+중첩 상환에는 정상 대출raw1과 잔고·승인도 준비한다. 담보raw1이면 한도0이므로 충분한 대출 전제가 아니다.
+
+| 콜백 시점 | 직접 관측할 값 | 오류 처리 결과 |
+| --- | --- | --- |
+| 대출의 USDC 전송 직후 | Bob이 USDC40을 받았고 개인/총부채도 이미 증가. A/S/공급자 지분 유지 | 중첩 상환의 정확한 `ReentrancyGuardReentrantCall`을 잡으면 바깥 대출만 1회 성공 |
+| 상환의 USDC 수령 직후 | Bob 잔고·승인이 줄고 풀 현금은 늘었지만 부채는 아직40 | 중첩 대출 오류를 잡으면 이어서 부채25로 감소. 오류를 전파하면 바깥 상환 전체 복구 |
+| 전파 실패 후 정상 재시도 | 직전 장부·두 토큰·승인과 콜백 설정/관측 저장 비교 | 실패 중 저장한 `attempted`까지 되돌아가며, 콜백 해제 뒤 같은 상환 성공 |
+
+모든 공급·출금·담보 입금·반환·대출·상환은 같은 `nonReentrant` 잠금을 사용한다.
+새 대출/상환 대표 경로와 기존 WBTC↔USDC 회귀를 함께 읽는다. 모든6×6 조합을 실행했다는 뜻은 아니다.
+기존 공급 중 중첩 대출, 기존 출금 중 중첩 상환도 각각 정확한 잠금 오류와 바깥1회 반영을 비교한다.
+같은 토큰 주소가 콜백을 끈 상태에서 raw1 대출/상환에 실제 성공하는 정상 대조도 두어 자원이 충분했는지 확인한다.
+가격 조회의 읽기 전용 호출이나 일반 자원 부족 오류를 공유 잠금의 실행 근거로 삼지 않는다.
+
+### 테스트를 찾고 읽는 지도
+
+아래 표는 로컬 EVM에서 실제 풀·토큰을 배포하는 동작 테스트다. Given은 준비, When은 호출,
+Then은 테스트의 실제 assertion이 비교하는 값이다. 실행과 독립 검토 결과는 PR의 검증 기록에서 확인한다.
+
+| 파일·대표 실제 함수 | Given — 준비 | When — 실행 | Then — 실제 확인 |
+| --- | --- | --- | --- |
+| [Configuration](test/LendingPoolConfiguration.t.sol) · `test_RejectsEighteenDecimalCollateral` | 정상 USDC6·가격8, 잔고/승인이 있는 담보18 | 새 풀 생성 | 대상 주소와 기대8·실제18 오류, 기존 상태·원시 가격 보존, 생성 이벤트 없음, 정상 재배포 대조 |
+| 같은 파일 · `test_RejectsMissingDecimalsInEveryRole` | 호출은 성공하지만 빈 응답인 대역 | 자산·담보·가격 역할에 각각 연결 | 세 경우 모두 해당 주소의 `InvalidDecimalsMetadata` |
+| [Borrow](test/LendingPoolBorrow.t.sol) · `test_BorrowFortyMovesCashAndRecordsOnlyDebt` | 정상 공급100·Bob 담보1·가격100 | Bob40 대출 | Bob 현금/부채40·풀60, 공급자 권리100·담보1·총발행량100 유지, 이벤트1회 |
+| 같은 파일 · `test_PriceDropBelowExistingDebtRejectsWithoutUnderflow` | 부채40 뒤 가격50으로 변경 | 추가 raw1 대출 | 한도35·현재부채40·요청1의 정확한 오류, 직전 snapshot 유지 |
+| [Repay](test/LendingPoolRepay.t.sol) · `test_RepayFifteenThenTwentyFiveAndReturnCollateral` | 정상 대출40 | 승인15→상환15, 승인25→상환25, 담보1 반환 | 단계별 현금75/100·부채25/0, 승인0, 마지막 WBTC 반환과 각 이벤트1회 |
+| 같은 파일 · `test_ExcessRepayPreservesFundedRequest` | 부채40·Bob잔고50·승인50·총발행량110 | 상환50 | 정확한 초과상환 오류, 잔고/승인/부채/총발행량 보존 |
+| 같은 파일 · `test_PriceAndMetadataFailureDoNotBlockPriceIndependentActions` | 정상 대출40 뒤 가격·metadata 조회 오류 주입 | 상환15+25·담보 추가/반환·공급자 출금/재공급 | 각 자체 규칙대로 성공/거절, 마지막 현금/A/S100·부채0. raw 조회도 원천 없이 성공 |
+| [Liquidity](test/LendingPoolLiquidity.t.sol) · `test_DirectTransferSurplusStaysThroughBorrowWithdrawRepayAndNewSupply` / `test_DirectMintSurplusStaysThroughBorrowWithdrawRepayAndNewSupply` | 정상 공급100 뒤 직접20 | 대출70→출금40 거절/30 성공→상환70→출금70→새 공급10 | 위 잉여 표의 각 중간값·정확한 오류·각 정상 이벤트를 비교 |
+| 같은 파일 · `test_AdditionalBorrowCannotSpendSurplusEvenWithEnoughCollateral` | C50/A100/D70, 담보2로 한도140 | 추가 대출40 | 담보 한도 내 요청이어도 사용 가능30 오류, 전체 관측값 보존 |
+| 같은 Liquidity 파일 · `test_EmptyAccountingWithSurplusRejectsBorrowAndRecognizesOnlyNewSupply` | A/S/D0·현금20·Bob 담보1 | raw1 대출 거절 뒤 Charlie10 정상 공급 | 사용 가능0의 정확한 오류·상태 보존, 새 지분/권리10·현금30 |
+| 같은 파일 · `test_BorrowUsesLowerActualCashAfterLoss` / `test_WithdrawalUsesLowerActualCashAfterLoss` | A100/D70·담보2에서 현금만10으로 조정, 총발행량80 | 각각11 거절 뒤10 대출/출금 | 현금 부족(10,11)·실패 snapshot 유지, 성공 뒤 현금0·A/D는 각각100/80 또는90/70 |
+| 같은 파일 · `test_TotalDebtAboveAssetsRaisesAccountingErrorWithoutMutation` | 시험 하네스로 A100·D101 | 사용 가능 현금 조회와 양수 출금 | 정확한 장부 오류·유동성 조회를 제외한 snapshot 보존·풀 이벤트 없음 |
+| [DebtFailure](test/LendingPoolDebtFailure.t.sol) · `test_BorrowTransferFalseRestoresAndRetries` / `test_RepayTransferRevertRestoresAndRetries` | 정상 자원과 실제 전송 뒤 장애 대역 | 실패 호출→장애 해제→동일 요청 | 정확한 SafeERC20/원본 오류·snapshot 복구·재시도1회와 이벤트1회 |
+| [BorrowReentrancy](test/LendingPoolBorrowReentrancy.t.sol) · `testBorrowCatchesNestedRepayAndRecordsOuterBorrowOnce` | 토큰 주소도 정상 부채·잔고·승인raw1 보유 | Bob40 대출 중 토큰 주소가 상환raw1 | 정확한 잠금 오류·선증가 부채 관측·바깥 대출1회와 중첩 주소 상태 보존 |
+| 같은 파일 · `testRepayCatchesNestedBorrowAndObservesDebtBeforeReduction` / `testRepayPropagatesNestedBorrowAndRestoresAllState` | 토큰 주소 담보raw2·한도raw1, Bob부채40·승인15 | Bob상환15 중 토큰 주소 대출raw1, 오류 잡기/전파 각각 | 수령 후·부채 감소 전 관측 / 전파 시 전체 장부·유한 승인·콜백 저장 복구 및 정상 재시도 |
+| 같은 BorrowReentrancy 파일 · `testBorrowPropagatesNestedRepayAndRestoresAllState` | 중첩 상환 가능한 토큰 주소·Bob 담보1·대출40 요청 | 대출 중 중첩 오류 전파→콜백 해제→대출 재시도 | 선증가 부채·실제 이동·콜백 저장 복구, 재시도 대출/이벤트1회 |
+| 같은 파일 · `testSupplyCatchesNestedBorrowAndRecordsOuterSupplyOnce` / `testWithdrawCatchesNestedRepayAndRecordsOuterWithdrawOnce` | 중첩 호출 자원과 Alice 공급/출금10 준비 | 기존 공급 중 대출raw1 / 출금 중 상환raw1 | 정확한 잠금 오류. 공급은 기록 증가 전, 출금은 기록 차감 후 관측; 바깥 요청만1회 반영 |
+| 같은 파일 · `testNestedBorrowResourcesPermitNormalRawOneBorrow` / `testNestedRepayResourcesPermitNormalRawOneRepay` | 콜백을 끄고 위와 같은 토큰 주소 자원 준비 | 정상 대출raw1 / 상환raw1 | 실제 성공·개인/총부채1 또는0·상환 승인0·각 이벤트1회 |
+
+대표 사례의 표가 나머지 모든 테스트의 상세 설명이나 사용자 이해 확인을 대신하지 않는다.
+추가 가격·한도·승인·사용자 분리·현금 조정·기존 회귀의 함수에는 목적과 실패 경계를 담은 한국어 NatSpec이 있다.
+
+| 역할 | 읽을 파일과 구분 |
+| --- | --- |
+| 제품 실행 코드 | [LendingPool](src/LendingPool.sol), [CollateralMath](src/libraries/CollateralMath.sol), [ShareMath](src/libraries/ShareMath.sol), [가격 인터페이스](src/interfaces/ICollateralPriceSource.sol). 풀 상태 변경과 순수 계산의 책임을 구분한다. |
+| 로컬 시험 자산·가격 | [MockUSDC](src/mocks/MockUSDC.sol), [MockWBTC](src/mocks/MockWBTC.sol), [Mock 가격 원천](test/mocks/MockCollateralPriceSource.sol), [항상 실패하는 가격 원천](test/mocks/RevertingCollateralPriceSource.sol). 실제 USDC·BTC·오라클 연동이 아니다. |
+| 테스트 준비·관측 | [BorrowTestBase](test/helpers/BorrowTestBase.sol)의 `_snapshot`은 전역8값과 Alice/Bob/Charlie/토큰 주소 각8값을 비교한다. 두 토큰 잔고/승인/총발행량, 공급 권리, 담보, 개인/총부채, 사용 가능 현금을 포함한다. |
+| 실패·재진입·잘못된 연결 대역 | [FailingMockUSDC](test/mocks/FailingMockUSDC.sol), [DebtReentrantMockUSDC](test/mocks/DebtReentrantMockUSDC.sol), [MetadataMocks](test/mocks/MetadataMocks.sol). 실패 조건과 관측 시점을 시험에서만 만든다. |
+| 기존 회귀와 시험용 하네스 | [기존 풀](test/LendingPool.t.sol), [지분](test/LendingPoolShares.t.sol), [담보](test/LendingPoolCollateral.t.sol), [담보 실패](test/LendingPoolCollateralFailure.t.sol), [담보 재진입](test/LendingPoolCollateralReentrancy.t.sol), [LendingPoolHarness](test/mocks/LendingPoolHarness.sol). 공통 재원 파일의 `InvalidDebtAccountingHarness`도 손상 장부 준비 전용이다. 하네스의 장부 setter는 일반 풀 API가 아니다. |
+| 실행·자동 검사 | [foundry.toml](foundry.toml), [.github/workflows/test.yml](.github/workflows/test.yml). 형식·빌드·동작 검사를 실행하며 학습 확인이나 독립 리뷰를 대신하지 않는다. |
+
+#14 신규 함수는 정밀도13·대출19·상환10·공통 재원11·전송 실패4·재진입8로65개다.
+기존141개와 함께 로컬 전체206개가 통과했다(실패0·skip0). 형식·빌드 검사도 통과했다.
+이 수는 테스트 함수/실행 항목의 수이며 한 함수 안의 입력 반복을 별도 함수로 더하지 않는다.
+#13의141개 기록은 아래 해당 단계의 근거다. 독립 리뷰 결과는 별도로 기록하고, #14 원격 CI는 해당 head를 게시한 뒤 확인한다.
 
 ## 실행 환경
 
@@ -28,6 +197,12 @@ forge test --match-contract CollateralPriceSourceTest -vv
 forge test --match-contract LendingPoolCollateralTest -vv
 forge test --match-contract LendingPoolCollateralFailureTest -vv
 forge test --match-contract LendingPoolCollateralReentrancyTest -vv
+forge test --match-contract LendingPoolConfigurationTest -vv
+forge test --match-contract LendingPoolBorrowTest -vv
+forge test --match-contract LendingPoolRepayTest -vv
+forge test --match-contract LendingPoolLiquidityTest -vv
+forge test --match-contract LendingPoolDebtFailureTest -vv
+forge test --match-contract LendingPoolBorrowReentrancyTest -vv
 forge test
 ```
 
@@ -63,13 +238,13 @@ Foundry `v1.7.0`을 설치한 뒤 아래 검사를 순서대로 수행한다.
 형식·빌드·테스트 중 하나라도 실패하면 해당 검사 작업이 실패한다.
 테스트는 `src/`의 실제 계약을 테스트 EVM에 배포해 호출하며, 지갑·RPC 비밀값은 필요하지 않다.
 PR의 Checks 탭에서 단계별 결과와 실패한 테스트 이름을 확인할 수 있다.
-CI 설정은 이 PR 변경에 포함하며, GitHub 실행 결과는 게시 후 별도로 확인한다.
+CI 설정은 #13에서 추가한 기존 경로를 유지한다. #14의 GitHub 실행 결과는 해당 head를 게시한 뒤 별도로 확인한다.
 
-## 이번에 읽을 동작: WBTC를 맡기고 본인 기록만큼 돌려받는다
+## #13에서 익힌 동작: 부채 없이 WBTC를 맡기고 돌려받는다
 
 #13은 **WBTC 보관과 반환 권리**를 기존 USDC 공급 지분과 분리한다.
-풀의 생성자는 `new LendingPool(usdc, wbtc)`로 두 자산을 고정한다.
-가격·부채·대출은 아직 연결하지 않았고, 담보 입금만으로 USDC를 받거나 공급 지분이 생기지는 않는다.
+아래는 #13에서 다룬 **부채0인 담보 보관 예시**다. 현재 생성자는 `new LendingPool(usdc, wbtc, priceSource)`로
+두 자산과 가격 원천을 고정한다. #14에서 대출·상환을 연결했어도 담보 입금 자체로 USDC를 받거나 공급 지분이 생기지는 않는다.
 
 먼저 [LendingPoolCollateralTest](test/LendingPoolCollateral.t.sol)의
 `test_DepositMovesWBTCAndCreditsOnlyCaller`와 `test_PartialAndFullReturnNeedNoNewApproval`을 읽는다.
@@ -98,7 +273,8 @@ _collateralBalances[msg.sender] += amount;
 
 첫 줄이 승인된 WBTC를 실제로 받은 다음 두 번째 줄이 외부 호출자의 담보 기록을 늘린다.
 `collateralOf(user)`는 그 기록을 원시 수량으로 돌려준다. 추가 입금도 덮어쓰지 않고 누적한다.
-`withdrawCollateral`은 0·본인 기록 초과를 거절한 뒤 기록을 먼저 줄이고 본인에게 전송한다.
+`withdrawCollateral`은 현재 0 → 본인 부채0 → 본인 기록 이하 순으로 검사한 뒤 기록을 먼저 줄이고 본인에게 전송한다.
+아래 기존 담보 사례들은 부채가0인 전제로 이 반환 동작을 읽는다.
 정확한 기록량의 반환은 허용하고, 기록이 없는 다른 사용자는 풀에 WBTC가 충분해도 반환받지 못한다.
 
 전송 실패가 바깥 호출까지 전파되면 그 호출에서의 상태 변화는 모두 되돌아간다.
@@ -109,13 +285,13 @@ _collateralBalances[msg.sender] += amount;
 
 | 흐름 | 동작·거절·보존 | 코드와 검증 |
 | --- | --- | --- |
-| 두 자산 배포 | asset/collateralAsset을 입력 주소로 고정. 각 0/코드 없음·같은 계약 거절 | LendingPool 생성자, 기존 USDC 배포 거절 회귀와 담보 테스트의 Constructor 사례 |
+| 두 자산 배포 회귀 | 정상 가격 원천을 추가해 asset/collateralAsset을 입력 주소로 고정. 각 0/코드 없음·같은 계약 거절 | LendingPool 생성자, 기존 USDC 배포 거절 회귀와 담보 테스트의 Constructor 사례 |
 | 본인 입금·추가 입금·조회 | 실제 수령 뒤 기록 증가. 양수 최소 단위1도 그대로 처리 | depositCollateral/collateralOf, 담보 테스트의 Deposit·AdditionalDeposits 사례 |
 | 본인 부분/전액 반환 | 기록 선차감 뒤 본인에게 요청량 지급. 새 승인 없이 가능 | withdrawCollateral, PartialAndFullReturn·ReturnsOneSmallestUnit·ReturnKeeps 사례 |
 | 0·승인·권리 거절 | 0을 우선 거절하고 승인 부족·본인 기록 초과의 정확한 인수 비교 | 담보 테스트의 Zero·InsufficientAllowance·AboveOwnRecord 사례 |
 | 담보/USDC 분리·직접 유입 | 담보는 USDC 잔고/지분을, USDC 동작은 0이 아닌 담보 기록을 보존. 직접 송금/발행은 기록 권리를 만들지 않음 | USDCSupplyAndWithdrawalPreserveNonzeroCollateral·DirectTransfer·DirectMint 사례 |
 | 전송·잔고·산술 실패 | 실제 이동 후 false/revert·잔고 부족·시험 장부 overflow에서 토큰/승인/기록 복구. 장애 해제 후 동일 재시도 | [담보 실패 테스트](test/LendingPoolCollateralFailure.t.sol), [WBTC 실패 대역](test/mocks/FailingMockWBTC.sol) |
-| 담보/USDC의 공통 잠금 | 네 진입점이 같은 잠금 사용. 중첩 오류를 잡으면 바깥1회, 전파하면 바깥도 복구 | [교차 재진입 테스트](test/LendingPoolCollateralReentrancy.t.sol), [두 토큰 콜백 대역](test/mocks/CollateralReentrantMocks.sol) |
+| 담보/USDC의 공통 잠금 | 기존 네 진입점의 대표 교차 호출. 현재 대출·상환도 같은 잠금을 사용. 중첩 오류를 잡으면 바깥1회, 전파하면 바깥도 복구 | [교차 재진입 테스트](test/LendingPoolCollateralReentrancy.t.sol), [두 토큰 콜백 대역](test/mocks/CollateralReentrantMocks.sol) |
 
 <details>
 <summary>테스트의 준비·실행·검증문을 따라 읽기</summary>
@@ -146,23 +322,25 @@ _collateralBalances[msg.sender] += amount;
 기존1에서0.4 반환 중 관측 기록은0.6이다. 중첩 호출자는 Bob이 아니라 토큰 계약 자신이다.
 이 권리와 잔고를 정상 준비해 잔고 부족 오류를 재진입 방어의 근거로 쓰지 않는다.
 실패 경로는 풀 성공 이벤트가 발생하기 전 중단된다. 수집된 토큰 내부 로그만으로 실제 실패 거래의 영수증 로그를 판단하지 않는다.
-기존 USDC 테스트·지분 하네스의 생성자는 모두 두 인자로 이행했고 기존 기대값은 유지했다.
+기존 USDC 테스트·지분 하네스의 생성자는 #14에서 정상 가격 원천을 받는 세 인자로 이행했다. 기존 담보 회귀의 준비값은 유지한다.
+이20값 snapshot에는 부채가 없으므로, 대출·상환 복구는 위 BorrowTestBase의 부채 포함 snapshot으로 별도 관측한다.
 
 </details>
 
-현재 담보 테스트는 정상/거절18개·실패9개·재진입10개다.
-기존104개와 함께 전체141개가 통과했고 실패/skip은0개이며 형식 검사·빌드·diff 공백 검사도 통과했다.
-이는 로컬 실행 결과이며 사용자 이해 확인·원격 CI·독립 구현 리뷰의 판정을 대신하지 않는다.
+#13 당시 담보 테스트는 정상/거절18개·실패9개·재진입10개였다.
+당시 기존104개와 함께 전체141개가 통과했고 실패/skip은0개이며 형식 검사·빌드·diff 공백 검사도 통과했다.
+이는 #13 작업본의 실행 근거다. 현재 #14의 최종 검사 수나 사용자 이해·독립 리뷰 완료로 재사용하지 않는다.
 
-생성자 검사는 주소/코드 존재/서로 다름까지다. 실제 자산 정밀도6/8·가격8 연결 검사와 잘못된 연결 배포 거절은
-[#14](https://github.com/0Chord/lending-protocol/issues/14)에서 도입한다. 임의 ERC20·세금/리베이스 토큰·실제 BTC 보관을 지원한다고 보장하지 않는다.
-이 단계는 부채가 없는 담보 보관이며, #14가 대출·상환과 부채0 반환 조건을 함께 추가한다.
+현재 생성자는 주소/코드 존재/서로 다름에 더해 실제 자산 정밀도6/8·가격8을 검사한다. 잘못된 연결은 배포 단계에서 거절한다.
+임의 ERC20·세금/리베이스 토큰·실제 BTC 보관을 지원한다고 보장하지 않는다.
+위 #13 예시는 무부채 담보 보관의 회귀이며, 현재 #14의 대출·상환과 부채0 반환 조건은 앞 절에서 함께 읽는다.
 실제 Chainlink·시장가격·배포는 이번 검증 범위에 포함되지 않는다.
 
 ## Mock 가격 계산기를 읽는 순서
 
 #12는 가격과 갱신시각을 검증한 뒤 **WBTC 담보의 USDC 가치와 그 70% 한도**를 계산한다.
-이 계산기는 풀의 담보 보관과 분리되어 있다. 가격을 대출에 연결하는 작업은 #14 범위다.
+이 계산기는 상태를 저장하지 않는 순수 계산으로 유지한다. 현재 #14의 `LendingPool.borrow`가
+고정 원천에서 읽은 가격·갱신시각과 본인 담보를 `maxDebtDown`에 전달한다.
 아래 가격은 테스트 입력이며 실제 시장가격이 아니다.
 
 첫 예시는 **1 WBTC·가격 100 USDC → 가치 100 USDC·한도 70 USDC**다.
@@ -200,14 +378,15 @@ WBTC 최소 단위 3과 가격 150 USDC를 준비하면 다음 차이가 드러�
 
 | 역할 | 입력 → 결과 | 위치 |
 | --- | --- | --- |
-| 원시 가격 계약 | 8자리 부호 있는 가격·갱신시각 반환 | [ICollateralPriceSource](src/interfaces/ICollateralPriceSource.sol) |
+| 원시 가격 계약 | metadata8과 부호 있는 가격·갱신시각 반환 | [ICollateralPriceSource](src/interfaces/ICollateralPriceSource.sol) |
 | 테스트 가격 준비 | 가격만/시각만 독립 변경, 잘못된 값도 그대로 반환 | [MockCollateralPriceSource](test/mocks/MockCollateralPriceSource.sol) |
 | 순수 계산 | 원시 가격·시각 검증 → 가치 내림 → 70% 한도 내림 | [CollateralMath](src/libraries/CollateralMath.sol)의 `collateralValueDown`, `maxDebtDown` |
 | 시험 호출 경계 | 원천을 한 번 읽어 반환값과 현재시각을 계산기에 전달 | [CollateralPriceSourceTest](test/CollateralPriceSource.t.sol)의 테스트 전용 harness |
 | 원천 장애 | 조회 즉시 `PriceSourceUnavailable()` 발생 | [RevertingCollateralPriceSource](test/mocks/RevertingCollateralPriceSource.sol) |
 
 계산기는 `internal pure`이며 토큰·가격 원천·`block.timestamp`를 직접 읽지 않는다.
-원천을 읽는 시험용 wrapper가 실제 현재시각을 전달한다. wrapper는 생산 풀 API가 아니다.
+#12 테스트에서는 원천을 읽는 시험용 wrapper가 실제 현재시각을 전달한다. wrapper는 생산 풀 API가 아니다.
+현재 풀의 `borrow`도 같은 계산기에 가격·갱신시각·`block.timestamp`를 전달한다.
 Mock 원천이 음수나 미래시각을 반환하는 것은 정상 동작이며, 그 값을 평가에 사용할 수 있는지는 계산기가 거절한다.
 가격 설정 시 갱신시각을 자동으로 현재시각으로 바꿔 오래된 가격을 숨기지 않는다.
 
@@ -252,7 +431,7 @@ Mock 원천이 음수나 미래시각을 반환하는 것은 정상 동작이며
 
 이 검사는 로컬 원천 모형·계산·시험 wrapper의 연결이다. 실제 Chainlink·시장가격·RPC를 호출하지 않는다.
 토큰 이동·승인·부채·담보 기록은 없고, 외부 연동이나 가격 조회의 재진입 방어를 검증한 것으로 확대하지 않는다.
-계산기의 getter가 테스트에 존재하는 것과 생산 풀에 가격 기능을 붙인 것은 다르다.
+#12의 wrapper 검사와 #14의 실제 풀 대출 검사는 별도 근거다. 후자는 위 대출 테스트에서 토큰 이동·담보·부채·공급자 장부까지 관측한다.
 
 </details>
 
@@ -297,7 +476,7 @@ Alice와 Bob은 테스트용 주소다. 아래 기대값은 모두 이슈에서 
 테스트에서 쓰는 Bob 호출자 설정은 새 토큰을 발행하는 것이 아니라 호출 주체를 바꾼다.
 
 위 검사는 로컬 Mock의 단위·발행 연결을 확인한다. 실제 WBTC의 BTC 준비금·발행 권한·교환 서비스 연동이나
-후속 담보·가격·대출 기능을 검증하지 않는다. 기존 MockUSDC·풀·지분 테스트도 별도로 유지한다.
+이 #11 토큰 자체의 테스트만으로 담보·가격·대출 기능을 검증하지 않는다. 기존 MockUSDC·풀·지분 테스트도 별도로 유지한다.
 
 ## 먼저 읽을 동작: 지분을 저장하고 예치금을 계산한다
 
@@ -329,7 +508,7 @@ function deposits(address user) public view returns (uint256) {
 첫 공급 테스트도 같은 기록과 USDC 성공 이벤트1회를 확인한다. `amount`와 이벤트 금액은 계속 USDC다.
 비율이 다른 상황은 [새 연결 테스트](test/LendingPoolShares.t.sol)에서만 준비하며, 현재 풀에 수익·손실을 인정하는 기능은 없다.
 
-아래 공급·출금의 기존 예시는 첫1:1 상태다. 그 예시의 예치금은 `deposits`가 계산한 USDC 값이며 별도 금액 원장을 저장하는 뜻이 아니다.
+아래 공급·출금의 기존 예시는 부채0의 첫1:1 상태다. 그 예시의 예치금은 `deposits`가 계산한 USDC 값이며 별도 금액 원장을 저장하는 뜻이 아니다.
 다른 비율의 반올림·거절·복구는 뒤의 접이식 테스트 안내에서 필요한 사례를 읽는다.
 
 ## MockUSDC를 읽는 순서
@@ -465,13 +644,14 @@ Alice의 호출에서 `msg.sender`는 Alice이고 `address(this)`는 풀이다.
 ## 출금 기능을 읽는 순서
 
 출금은 요청한 USDC를 본인에게 돌려주면서 그 금액에 필요한 지분을 올림해 차감한다.
-제품 코드는 [LendingPool.withdraw](src/LendingPool.sol#L87), 검증 코드는 [LendingPoolTest](test/LendingPool.t.sol)에 있다.
-먼저 첫 40 출금과 실패 복구를 읽고, 나머지 경계는 아래 테스트 표로 이어간다.
+제품 코드는 [LendingPool.withdraw](src/LendingPool.sol#L236), 검증 코드는 [LendingPoolTest](test/LendingPool.t.sol)에 있다.
+먼저 부채0인 첫 40 출금과 실패 복구를 읽고, 나머지 경계는 아래 테스트 표로 이어간다.
+현재 출금의 현금 한도는 대출과 같은 `availableLiquidity()`이며, 아래 기존 무부채·무잉여 예시에서는 실제 현금과 같다.
 
 | 흐름 | 시작 → 결과 |
 | --- | --- |
-| 정상 출금 | 본인 예치·현금이 충분함 → 기록 차감·토큰 반환·출금 이벤트 1회 |
-| 요청 거절 | 0 → 본인 예치 부족 → 현금 부족 순으로 검사 → 정확한 오류, 상태 보존 |
+| 정상 출금 | 본인 예치·사용 가능 현금이 충분함 → 기록 차감·토큰 반환·출금 이벤트 1회 |
+| 요청 거절 | 0 → 본인 예치 부족 → 사용 가능 현금 부족 순으로 검사 → 정확한 오류, 상태 보존 |
 | 토큰 실패 | 기록을 줄인 뒤 transfer에서 false/revert → 해당 출금의 모든 변경 복구 |
 | 중첩 호출 | 전송 중 supply/withdraw 재호출 → 공통 잠금으로 중첩 동작 거절 |
 | 직접 유입 | 풀에 직접 transfer/mint → 현금만 증가, 출금 권리는 생기지 않음 |
@@ -499,8 +679,8 @@ function withdraw(uint256 amount) external nonReentrant {
     if (amount == 0) revert ZeroAmount();
     uint256 deposited = deposits(msg.sender);
     if (amount > deposited) revert InsufficientDeposit(deposited, amount);
-    uint256 cash = asset.balanceOf(address(this));
-    if (amount > cash) revert InsufficientLiquidity(cash, amount);
+    uint256 available = availableLiquidity();
+    if (amount > available) revert InsufficientLiquidity(available, amount);
 
     uint256 burnedShares = ShareMath.toSharesUp(amount, _accountedAssets, totalShares);
     uint256 remainingAssets = _accountedAssets - amount;
@@ -720,14 +900,17 @@ assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
 
 MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이다.
 토큰 발행에는 실제 자산 입금이 없으며, 풀의 예치 권리를 만들지 않는다.
-풀은 배포한 자산 하나를 고정하며 본인 공급과 본인 지갑으로의 출금만 받는다. 자산 변경·타인 대신 공급·수령자 지정·이자·대출·구제 함수는 없다.
+풀은 대출 자산 MockUSDC6·담보 MockWBTC8·Mock 가격 원천8을 배포 때 고정한다. 본인 공급·출금·담보 입금/반환·원금 대출/상환을 다룬다.
+자산 변경·대리 공급/차입/상환·수령자 지정·이자·청산·잉여 회수·구제 함수는 없다. 가격 하락만으로 부채를 삭제하거나 손실을 보전하지 않는다.
 실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다. 배포는 이번 작업 범위에 포함하지 않는다.
 
 풀에 직접 전송·발행한 토큰은 예치 권리를 만들지 않는다. 직접 전송 10 후 정상 공급 100이면 풀 현금은 110이고 예치 권리는 100이다.
 따라서 직접 송금이 있는 경우까지 풀 현금과 예치 합이 항상 같다고 가정하지 않는다.
-생성자의 코드 존재 검사는 모든 ERC20의 안전성을 보장하지 않는다. 재진입 검증도 임의의 악성 자산 지원을 의미하지 않는다.
+생성자의 코드 존재·6/8/8 metadata 검사는 모든 ERC20의 안전성이나 가격의 진실성을 보장하지 않는다.
+재진입 검증도 임의의 악성 자산 지원을 의미하지 않는다. 실제 외부 서비스·시장가격의 정확성은 이번 로컬 Mock 범위 밖이다.
 
-테스트는 소수점 설정·지급 연결 및 공급·출금의 정상·거절·전송 실패 결과를 확인한다.
+테스트는 단위 연결·공급 권리·담보·원금 부채·공통 재원의 정상·거절·전송 실패와 대표 재진입 경로를 다룬다.
+작성된 사례·실제 실행 결과·독립 검토 완료는 구분하며, 로컬206개 통과를 사용자 이해나 독립 리뷰 완료로 읽지 않는다.
 OpenZeppelin의 모든 ERC20 동작이나 실제 USDC 연동을 검증하는 범위는 아니다.
 생성되는 `out/`, `cache/`, `broadcast/`는 버전 관리에서 제외한다.
 

@@ -5,16 +5,20 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {LendingPool} from "../src/LendingPool.sol";
+import {ICollateralPriceSource} from "../src/interfaces/ICollateralPriceSource.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 import {MockWBTC} from "../src/mocks/MockWBTC.sol";
 import {CollateralTestBase} from "./helpers/CollateralTestBase.sol";
 import {FailingMockWBTC} from "./mocks/FailingMockWBTC.sol";
+import {MockCollateralPriceSource} from "./mocks/MockCollateralPriceSource.sol";
 
 /// @title 담보 장부 합산 범위만 검증하는 테스트 전용 풀
 /// @notice 정상 토큰 전송으로 만들 수 없는 최대 기록을 산술 실패 사례에만 주입한다.
 contract CollateralOverflowHarness is LendingPool {
-    /// @notice 일반 풀과 같은 두 자산 검사를 거쳐 하네스를 배포한다.
-    constructor(IERC20 asset_, IERC20 collateralAsset_) LendingPool(asset_, collateralAsset_) {}
+    /// @notice 자산·담보·가격 원천을 일반 풀과 같은 생성자 검사에 그대로 전달한다.
+    constructor(IERC20 asset_, IERC20 collateralAsset_, ICollateralPriceSource priceSource_)
+        LendingPool(asset_, collateralAsset_, priceSource_)
+    {}
 
     /// @notice 산술 실패 테스트에 한해 담보 기록을 직접 준비한다.
     function setCollateralForTest(address user, uint256 amount) external {
@@ -156,7 +160,8 @@ contract LendingPoolCollateralFailureTest is CollateralTestBase {
     function testInsufficientBobBalanceRestoresConsumedAllowanceAndExistingCollateral() public {
         usdc = new MockUSDC();
         wbtc = new FailingMockWBTC();
-        pool = new LendingPool(usdc, wbtc);
+        priceSource = new MockCollateralPriceSource(100e8, block.timestamp);
+        pool = new LendingPool(usdc, wbtc, priceSource);
         usdc.mint(ALICE, 200_000_000);
         vm.startPrank(ALICE);
         usdc.approve(address(pool), 100_000_000);
@@ -227,7 +232,8 @@ contract LendingPoolCollateralFailureTest is CollateralTestBase {
     function testCollateralAdditionOverflowRestoresActualTransferAndAllowance() public {
         usdc = new MockUSDC();
         wbtc = new MockWBTC();
-        CollateralOverflowHarness harness = new CollateralOverflowHarness(usdc, wbtc);
+        priceSource = new MockCollateralPriceSource(100e8, block.timestamp);
+        CollateralOverflowHarness harness = new CollateralOverflowHarness(usdc, wbtc, priceSource);
         pool = harness;
         usdc.mint(ALICE, 200_000_000);
         vm.startPrank(ALICE);

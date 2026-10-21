@@ -6,6 +6,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {LendingPool} from "../../src/LendingPool.sol";
 import {MockUSDC} from "../../src/mocks/MockUSDC.sol";
 import {MockWBTC} from "../../src/mocks/MockWBTC.sol";
+import {MockCollateralPriceSource} from "../mocks/MockCollateralPriceSource.sol";
 
 /// @title 담보 테스트의 정상 준비와 양 자산 관측
 /// @notice Alice의 USDC 공급과 Bob의 WBTC 잔고를 준비하고 서로 다른 장부를 비교한다.
@@ -16,9 +17,12 @@ abstract contract CollateralTestBase is Test {
     bytes32 internal constant RETURNED = keccak256("CollateralWithdrawn(address,uint256)");
     bytes32 internal constant SUPPLIED = keccak256("Supplied(address,uint256)");
     bytes32 internal constant WITHDRAWN = keccak256("Withdrawn(address,uint256)");
+    bytes32 internal constant BORROWED = keccak256("Borrowed(address,uint256)");
+    bytes32 internal constant REPAID = keccak256("Repaid(address,uint256)");
 
     MockUSDC internal usdc;
     MockWBTC internal wbtc;
+    MockCollateralPriceSource internal priceSource;
     LendingPool internal pool;
 
     /// @notice 매 사례를 정상 두 자산과 새로운 풀에서 시작한다.
@@ -30,7 +34,8 @@ abstract contract CollateralTestBase is Test {
     function _preparePool(MockUSDC usdc_, MockWBTC wbtc_) internal {
         usdc = usdc_;
         wbtc = wbtc_;
-        pool = new LendingPool(usdc, wbtc);
+        priceSource = new MockCollateralPriceSource(100e8, block.timestamp);
+        pool = new LendingPool(usdc, wbtc, priceSource);
         usdc.mint(ALICE, 200_000_000);
         vm.startPrank(ALICE);
         usdc.approve(address(pool), 100_000_000);
@@ -138,13 +143,17 @@ abstract contract CollateralTestBase is Test {
         assertEq(_countEvents(logs, topic == DEPOSITED ? RETURNED : DEPOSITED), 0);
         assertEq(_countEvents(logs, SUPPLIED), 0);
         assertEq(_countEvents(logs, WITHDRAWN), 0);
+        assertEq(_countEvents(logs, BORROWED), 0);
+        assertEq(_countEvents(logs, REPAID), 0);
     }
 
-    /// @notice 거절 경로가 풀 성공 이벤트를 남기지 않았는지 네 종류를 함께 확인한다.
+    /// @notice 거절 경로가 풀 성공 이벤트를 남기지 않았는지 여섯 종류를 함께 확인한다.
     function _assertNoProtocolEvents(Vm.Log[] memory logs) internal view {
         assertEq(_countEvents(logs, DEPOSITED), 0);
         assertEq(_countEvents(logs, RETURNED), 0);
         assertEq(_countEvents(logs, SUPPLIED), 0);
         assertEq(_countEvents(logs, WITHDRAWN), 0);
+        assertEq(_countEvents(logs, BORROWED), 0);
+        assertEq(_countEvents(logs, REPAID), 0);
     }
 }

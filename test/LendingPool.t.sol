@@ -10,6 +10,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 import {MockWBTC} from "../src/mocks/MockWBTC.sol";
 import {LendingPool} from "../src/LendingPool.sol";
+import {MockCollateralPriceSource} from "./mocks/MockCollateralPriceSource.sol";
 import {FailingMockUSDC} from "./mocks/FailingMockUSDC.sol";
 import {ReentrantMockUSDC} from "./mocks/ReentrantMockUSDC.sol";
 import {CrossReentrantMockUSDC} from "./mocks/CrossReentrantMockUSDC.sol";
@@ -24,6 +25,7 @@ contract LendingPoolTest is Test {
 
     MockUSDC private token;
     MockWBTC private collateralToken;
+    MockCollateralPriceSource private priceSource;
     LendingPool private pool;
 
     struct SupplyState {
@@ -45,7 +47,8 @@ contract LendingPoolTest is Test {
     function setUp() public {
         token = new MockUSDC();
         collateralToken = new MockWBTC();
-        pool = new LendingPool(token, collateralToken);
+        priceSource = new MockCollateralPriceSource(100e8, block.timestamp);
+        pool = new LendingPool(token, collateralToken, priceSource);
         token.mint(ALICE, 200_000_000);
     }
 
@@ -89,14 +92,14 @@ contract LendingPoolTest is Test {
     /// @notice 정상 담보를 연결해도 USDC의 0 주소는 배포 단계에서 거절한다.
     function test_ConstructorRejectsZeroAsset() public {
         vm.expectRevert(abi.encodeWithSignature("InvalidAsset(address)", address(0)));
-        new LendingPool(IERC20(address(0)), collateralToken);
+        new LendingPool(IERC20(address(0)), collateralToken, priceSource);
     }
 
     /// @notice 정상 담보를 연결해도 코드가 없는 일반 주소를 USDC로 설정하지 못한다.
     function test_ConstructorRejectsAssetWithoutCode() public {
         assertEq(ALICE.code.length, 0);
         vm.expectRevert(abi.encodeWithSignature("InvalidAsset(address)", ALICE));
-        new LendingPool(IERC20(ALICE), collateralToken);
+        new LendingPool(IERC20(ALICE), collateralToken, priceSource);
     }
 
     /// @notice 추가 공급은 기존 예치를 덮어쓰지 않고 요청한 20 USDC만 더한다.
@@ -297,7 +300,7 @@ contract LendingPoolTest is Test {
     /// @notice 충분한 잔고·승인이 있는 중첩 공급만 방어하고 바깥 공급 100은 한 번 반영한다.
     function test_ReentryIsRejectedWhileOuterSupplySucceedsOnce() public {
         ReentrantMockUSDC reentrantToken = new ReentrantMockUSDC();
-        LendingPool reentrantPool = new LendingPool(reentrantToken, collateralToken);
+        LendingPool reentrantPool = new LendingPool(reentrantToken, collateralToken, priceSource);
         reentrantToken.mint(ALICE, 200_000_000);
         reentrantToken.mint(address(reentrantToken), 1);
         reentrantToken.configureReentry(reentrantPool);
@@ -652,7 +655,7 @@ contract LendingPoolTest is Test {
     /// @dev 정상 공급 100 뒤 양쪽 승인을 별도로 남기고 transfer 장애는 검사 직전에 켠다.
     function _prepareWithdrawalFailurePool() private returns (FailingMockUSDC failureToken, LendingPool failurePool) {
         failureToken = new FailingMockUSDC();
-        failurePool = new LendingPool(failureToken, collateralToken);
+        failurePool = new LendingPool(failureToken, collateralToken, priceSource);
         failureToken.mint(ALICE, 200_000_000);
         _approveAndSupply(failureToken, failurePool, ALICE, 100_000_000);
         vm.prank(ALICE);
@@ -825,7 +828,7 @@ contract LendingPoolTest is Test {
         returns (CrossReentrantMockUSDC callbackToken, LendingPool callbackPool)
     {
         callbackToken = new CrossReentrantMockUSDC();
-        callbackPool = new LendingPool(callbackToken, collateralToken);
+        callbackPool = new LendingPool(callbackToken, collateralToken, priceSource);
         callbackToken.mint(ALICE, 200_000_000);
         callbackToken.mint(address(callbackToken), 2);
         callbackToken.prepareOwnDeposit(callbackPool);
@@ -899,7 +902,7 @@ contract LendingPoolTest is Test {
     /// @dev 장애를 켜기 전에 40 공급을 완료하고 다음 호출의 유한 승인 100을 별도로 준다.
     function _prepareFailurePool() private returns (FailingMockUSDC failureToken, LendingPool failurePool) {
         failureToken = new FailingMockUSDC();
-        failurePool = new LendingPool(failureToken, collateralToken);
+        failurePool = new LendingPool(failureToken, collateralToken, priceSource);
         failureToken.mint(ALICE, 200_000_000);
         _approveAndSupply(failureToken, failurePool, ALICE, 40_000_000);
         _assertAccounting(failurePool, 40_000_000, 40_000_000, 40_000_000, 0);
