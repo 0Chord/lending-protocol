@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {LendingPool} from "../src/LendingPool.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
+import {MockWBTC} from "../src/mocks/MockWBTC.sol";
 import {LendingPoolHarness} from "./mocks/LendingPoolHarness.sol";
 import {FailingMockUSDC} from "./mocks/FailingMockUSDC.sol";
 import {CrossReentrantMockUSDC} from "./mocks/CrossReentrantMockUSDC.sol";
@@ -16,12 +17,14 @@ contract LendingPoolSharesTest is Test {
     address private constant ALICE = address(0xA11CE);
     address private constant BOB = address(0xB0B);
     MockUSDC private token;
+    MockWBTC private collateralToken;
     LendingPoolHarness private pool;
 
-    /// @notice 각 사례는 별도 토큰·풀에서 시작한다.
+    /// @notice 각 사례는 정상 USDC·WBTC를 연결한 별도 풀에서 시작한다.
     function setUp() public {
         token = new MockUSDC();
-        pool = new LendingPoolHarness(token);
+        collateralToken = new MockWBTC();
+        pool = new LendingPoolHarness(token, collateralToken);
         token.mint(ALICE, 200_000_000);
     }
 
@@ -359,7 +362,7 @@ contract LendingPoolSharesTest is Test {
     function _prepareNonUnitReentry(bool propagateError) private returns (CrossReentrantMockUSDC callbackToken) {
         callbackToken = new CrossReentrantMockUSDC();
         token = callbackToken;
-        pool = new LendingPoolHarness(token);
+        pool = new LendingPoolHarness(token, collateralToken);
         token.mint(address(callbackToken), 2);
         callbackToken.prepareOwnDeposit(pool);
         token.mint(ALICE, 5);
@@ -489,7 +492,7 @@ contract LendingPoolSharesTest is Test {
     /// @dev 정상 1:1 공급으로 개인 지분을 만들고 직접 발행과 시험용 장부 주입을 구분한다.
     function _prepareRatio(MockUSDC currentToken, uint256 assets, uint256 aliceShares, uint256 bobShares) private {
         token = currentToken;
-        pool = new LendingPoolHarness(token);
+        pool = new LendingPoolHarness(token, collateralToken);
         token.mint(ALICE, aliceShares);
         _supply(ALICE, aliceShares);
         if (bobShares != 0) {
