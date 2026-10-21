@@ -6,7 +6,8 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#3](https://github.com/0Chord/lending-protocol/issues/3)의 본인 출금과
 [#7](https://github.com/0Chord/lending-protocol/issues/7)의 지분 환산 계산과
 [#8](https://github.com/0Chord/lending-protocol/issues/8)의 공급·출금·조회 연결과
-[#11](https://github.com/0Chord/lending-protocol/issues/11)의 테스트용 MockWBTC다. 테스트 전용 로컬 학습 프로젝트다.
+[#11](https://github.com/0Chord/lending-protocol/issues/11)의 테스트용 MockWBTC와
+[#12](https://github.com/0Chord/lending-protocol/issues/12)의 Mock 가격·담보 가치/한도 계산이다. 테스트 전용 로컬 학습 프로젝트다.
 
 ## 실행 환경
 
@@ -21,6 +22,8 @@ forge test --match-contract MockWBTCTest -vv
 forge test --match-contract LendingPoolTest -vv
 forge test --match-contract LendingPoolSharesTest -vv
 forge test --match-contract ShareMathTest -vv
+forge test --match-contract CollateralMathTest -vv
+forge test --match-contract CollateralPriceSourceTest -vv
 forge test
 ```
 
@@ -43,7 +46,103 @@ forge-std는 현재 설치된 Foundry에서 사용할 조합으로 고정했다.
 [v1.17.0 릴리스](https://github.com/foundry-rs/forge-std/releases/tag/v1.17.0)는 새 `Vm.Gas` 구조 때문에 Foundry v1.8.3 이상을 권고한다.
 EVM 대상은 컴파일러 기본값 변화에 영향을 받지 않도록 명시했다.
 
-## 이번에 읽을 동작: 담보 실습용 MockWBTC
+## 이번에 읽을 동작: Mock 가격으로 담보 가치와 한도를 계산한다
+
+#12는 가격과 갱신시각을 검증한 뒤 **WBTC 담보의 USDC 가치와 그 70% 한도**를 계산한다.
+아직 풀에 담보를 맡기거나 대출하지 않는다. 아래 가격은 테스트 입력이며 실제 시장가격이 아니다.
+
+첫 예시는 **1 WBTC·가격 100 USDC → 가치 100 USDC·한도 70 USDC**다.
+테스트는 [CollateralMathTest](test/CollateralMath.t.sol)의 `test_OneWBTCAtOneHundredUSDC`부터 읽는다.
+
+| 값 | 사람이 읽는 수량 | 함수에 전달하는 정수 |
+| --- | --- | ---: |
+| WBTC 수량 | 1 WBTC, 소수점 8자리 | `100_000_000` |
+| 가격 | 1 WBTC당 100 USDC, 소수점 8자리 직접호가 | `10_000_000_000` |
+| 가치 / 한도 | 100 / 70 USDC, 소수점 6자리 | `100_000_000` / `70_000_000` |
+
+갱신시각·현재시각을 각각 `10_000`초로 준비한다. [CollateralMath](src/libraries/CollateralMath.sol)는
+가격 → 갱신시각 → 지난 시간 순으로 검사하고, 수량과 가격을 곱해 `10^10`으로 나눈다.
+8자리 두 개를 곱한 16자리에서 USDC 6자리를 남기기 위한 배율이다.
+그 뒤 먼저 내린 가치에 `7000 / 10000`을 적용해 다시 내린다.
+두 곱셈은 기존 고정 OpenZeppelin `Math.mulDiv`를 사용하므로 중간 곱이 크더라도 최종 결과가 맞으면 계산할 수 있다.
+
+### 왜 두 번 내리나
+
+이 명세는 **먼저 USDC 최소 단위로 확정한 담보 가치에 70%를 적용**한다.
+WBTC 최소 단위 3과 가격 150 USDC를 준비하면 다음 차이가 드러난다.
+아래 숫자는 USDC 개수가 아니라 **최소 단위**이며, 최소 단위 1은 0.000001 USDC다.
+
+| 단계 | 계산 | 반환하는 정수 |
+| --- | --- | ---: |
+| 담보 가치 | WBTC raw 3 × 가격 raw 15,000,000,000 ÷ 10,000,000,000 = 4.5 | 4 |
+| 대출 한도 | 먼저 내린 4 × 70% = 2.8 | 2 |
+
+계산을 합쳐 마지막에만 내리면 `4.5 × 70% = 3.15 → 3`이어서 결과가 달라진다.
+두 번 내리는 것이 모든 프로토콜의 필수 규칙이라는 뜻은 아니다. 이번 구현은 이슈의 두 단계 계약을 유지하며,
+`test_ValueAndLimitRoundDownInTwoSteps`가 결과 4와 2를 각각 직접 비교한다.
+100 USDC처럼 나누어떨어지는 예시에서는 두 방식의 차이가 없다.
+
+### 계산과 가격 원천의 역할
+
+| 역할 | 입력 → 결과 | 위치 |
+| --- | --- | --- |
+| 원시 가격 계약 | 8자리 부호 있는 가격·갱신시각 반환 | [ICollateralPriceSource](src/interfaces/ICollateralPriceSource.sol) |
+| 테스트 가격 준비 | 가격만/시각만 독립 변경, 잘못된 값도 그대로 반환 | [MockCollateralPriceSource](test/mocks/MockCollateralPriceSource.sol) |
+| 순수 계산 | 원시 가격·시각 검증 → 가치 내림 → 70% 한도 내림 | [CollateralMath](src/libraries/CollateralMath.sol)의 `collateralValueDown`, `maxDebtDown` |
+| 시험 호출 경계 | 원천을 한 번 읽어 반환값과 현재시각을 계산기에 전달 | [CollateralPriceSourceTest](test/CollateralPriceSource.t.sol)의 테스트 전용 harness |
+| 원천 장애 | 조회 즉시 `PriceSourceUnavailable()` 발생 | [RevertingCollateralPriceSource](test/mocks/RevertingCollateralPriceSource.sol) |
+
+계산기는 `internal pure`이며 토큰·가격 원천·`block.timestamp`를 직접 읽지 않는다.
+원천을 읽는 시험용 wrapper가 실제 현재시각을 전달한다. wrapper는 생산 풀 API가 아니다.
+Mock 원천이 음수나 미래시각을 반환하는 것은 정상 동작이며, 그 값을 평가에 사용할 수 있는지는 계산기가 거절한다.
+가격 설정 시 갱신시각을 자동으로 현재시각으로 바꿔 오래된 가격을 숨기지 않는다.
+
+### 잘못된 입력은 계산 전에 거절한다
+
+| 순서 | 입력 | 관측하는 오류/결과 |
+| --- | --- | --- |
+| 1 | 가격 0·음수·int256 최솟값 | `InvalidPrice(입력 가격)` |
+| 2 | 갱신시각 0 또는 현재시각보다 미래 | `InvalidPriceTimestamp(갱신시각, 현재시각)` |
+| 3 | 갱신 후 정확히 3600초 / 3601초 | 계산 허용 / `StalePrice(갱신시각, 현재시각)` |
+| 4 | 각 단계의 최종 정수 결과가 uint256 범위 초과 | 정확한 `Panic(0x11)` 전파 |
+
+담보가 0이어도 위 가격·시각 검사를 생략하지 않는다. 유효한 입력의 담보 0은 가치·한도가 모두 0이다.
+양수를 확인한 뒤 가격을 uint256으로 변환하고, 미래시각을 거절한 뒤 경과시간을 뺀다.
+`maxDebtDown`은 먼저 가치 계산을 호출하므로 동일한 오류 순서와 첫 단계 범위 제한을 유지한다.
+실패는 오류를 잡아 0 한도로 바꾸지 않고 호출자에게 전파하며, 계산기 자체는 상태를 바꾸지 않는다.
+
+<details>
+<summary>#12 테스트의 준비·실행·실제 확인</summary>
+
+[CollateralMathTest](test/CollateralMath.t.sol)는 매 테스트 새 외부 harness를 준비한다.
+정상 값은 이슈의 고정 정수와 비교하고, 오류는 `vm.expectRevert` 다음에 harness의 external 메서드를 실제 호출한다.
+같은 기대 오류를 가치·한도 두 함수에서 각각 전체 인수까지 비교한다.
+
+| 테스트 묶음 | 준비·실행 | 실제 확인 |
+| --- | --- | --- |
+| 1 WBTC·0.5 WBTC·최소 단위 3·담보 0 | 유효한 가격·시각, 고정 수량 입력 | 가치/한도 각각 100m/70m, 50m/35m, 4/2, 0/0 |
+| 비양수 가격·오류 순서 | 가격 0/-1/int256.min, 담보0+가격0+시각0 포함 | 각 가격의 `InvalidPrice`, 담보0도 가격 오류를 우선 |
+| 시간과 우선순위 | 현재10000, 갱신6400/6399/0/10001, 담보0도 별도 준비 | 3600초 허용·3601초 거절, 0/미래시각은 timestamp 오류. 두 함수 모두 같은 인수 |
+| 큰 중간 곱과 최종 범위 | 담보 uint256.max, 가격10,000,000,000 / 10,000,000,001 | 첫 입력의 가치 max와 고정 70% 한도 성공, 두 번째는 가치부터 범위 초과해 두 함수 모두 Panic(0x11) |
+
+[CollateralPriceSourceTest](test/CollateralPriceSource.t.sol)는 다음 원천/연결 사례를 별도로 확인한다.
+
+| 준비·실행 | 실제 확인 |
+| --- | --- |
+| 생성자에서 가격10b·시각6400 주입 후 interface 조회 | 주입한 두 정수 그대로 반환 |
+| 가격만15b로 변경 / 이어 시각만0으로 변경 | 바꾸지 않은 나머지 값 보존 |
+| 생성자·setter의 잘못된 원시값 표 | (0,0), (-1,6400), (int256.min,10001), (15b,10001)을 현재10000에서도 그대로 반환 |
+| 100·150 USDC 가격의 원천을 wrapper로 각각 조회해 1 WBTC 한도 계산 | 70m·105m, 각 원천의 실제 `latestPrice()` 호출 대상·calldata·정확히1회 확인 |
+| 오래된 시각6399의 원천을 wrapper에 연결 | StalePrice(6399,10000), 원시 가격·시각 보존. 소비자가 시각을 덮어쓰지 않음 |
+| 조회 시 오류를 내는 원천을 wrapper에 연결 | 실제 조회와 정확한 원천 오류 전파. 0 반환이나 오류 삼킴으로 통과하지 않음 |
+
+이 검사는 로컬 원천 모형·계산·시험 wrapper의 연결이다. 실제 Chainlink·시장가격·RPC를 호출하지 않는다.
+토큰 이동·승인·부채·담보 기록은 없고, 외부 연동이나 가격 조회의 재진입 방어를 검증한 것으로 확대하지 않는다.
+계산기의 getter가 테스트에 존재하는 것과 생산 풀에 가격 기능을 붙인 것은 다르다.
+
+</details>
+
+## MockWBTC를 읽는 순서
 
 #11은 **소수점 8자리 토큰과 테스트 잔고 발행**만 추가한다.
 실제 BTC를 보관하거나 BTC와 교환하는 기능은 없다. 기존 LendingPool은 계속 MockUSDC만 사용한다.
