@@ -6,6 +6,11 @@ import {ICollateralPriceSource} from "../../src/interfaces/ICollateralPriceSourc
 /// @title 가격과 갱신시각을 독립적으로 설정하는 시험 원천
 /// @notice 잘못된 가격·시각도 그대로 제공해 소비자의 검증을 시험한다.
 contract MockCollateralPriceSource is ICollateralPriceSource {
+    /// @inheritdoc ICollateralPriceSource
+    function decimals() external pure override returns (uint8) {
+        return 8;
+    }
+
     int256 private _price;
     uint256 private _updatedAt;
 
