@@ -11,9 +11,152 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#13](https://github.com/0Chord/lending-protocol/issues/13)의 본인 WBTC 담보 입금·반환과
 [#14](https://github.com/0Chord/lending-protocol/issues/14)의 이자 없는 담보대출·상환 연결과
 [#19](https://github.com/0Chord/lending-protocol/issues/19)의 순수 이자 계산과
-[#23](https://github.com/0Chord/lending-protocol/issues/23)의 고정 금리 상수 분리다. 테스트 전용 학습 프로젝트다.
+[#23](https://github.com/0Chord/lending-protocol/issues/23)의 고정 금리 상수 분리와
+[#20](https://github.com/0Chord/lending-protocol/issues/20)의 토큰 없는 부채 장부다. 테스트 전용 학습 프로젝트다.
 
-## 이번에 읽을 동작: 연10%를 상수로 읽고 같은 이자를 계산한다
+## 이번에 읽을 동작: 빌린 원금과 이자를 기록한다
+
+[DebtLedger](src/accounting/DebtLedger.sol)는 **사람별 원금·미납 이자·마지막 계산 시각을 저장하는 내부 라이브러리**다.
+전체 원금·이자도 별도로 기록한다. 기존 [InterestMath](src/libraries/InterestMath.sol)가 계산을 담당하고,
+장부는 어느 시점의 계산을 저장했는지 관리한다. 연10%·남은 원금 기준 단리와 이자 우선 상환은 그대로다.
+
+첫 예시는 다음과 같다. 금액은 USDC이며 실제 토큰을 옮기지 않고 장부 기록으로 검증한다.
+
+| 시점·동작 | 원금 | 미납 이자 | 의미 |
+| --- | ---: | ---: | --- |
+| 시각0에40 차입 기록 | 40 | 0 | 개인·전체에 원금40 저장 |
+| 반년 뒤 조회 | 40 | 2 | 현재 값을 계산하지만 저장 기록은 그대로 |
+| 같은 시각12 상환 기록 | 30 | 0 | 이자2와 원금10을 갚고 두 장부의 시각도 갱신 |
+| 다시 반년 뒤 조회 | 30 | 1.5 | 줄어든 원금30에만 이자 발생 |
+
+### 저장값과 조회값
+
+`Position`에는 `principal`(USDC 최소 단위), `interestNumerator`(정확한 미납 이자 분자), `updatedAt`이 있다.
+`State.borrowers`는 주소별 기록, `State.total`은 전체 기록이다. 이자를 최소 단위에서 잘라 저장하지 않는다.
+분모는 계산기의 `Q=315_360_000_000`을 재사용하고, 정확 채권은 `principal × Q + interestNumerator`다.
+
+`borrowerSnapshot`과 `totalSnapshot`은 기록 이후의 이자를 계산해 `Snapshot`으로 반환한다.
+`Snapshot.updatedAt`은 요청한 계산 시각이고, 실제 저장된 `Position.updatedAt`은 조회만으로 바뀌지 않는다.
+**시각0은 정상 시각**이다. 처음 빌리기 전이나 모두 갚은 후의 기간에는 원금0이므로 이자도0이다.
+운영 연결 시 호출자는 일관된 `block.timestamp`를 전달해야 한다. 지금은 하네스가 시험 시각을 전달한다.
+
+### 전체 이자를 두 번 더하지 않는 방법
+
+Bob이 먼저40을 빌리고 반년 뒤 Charlie가20을 빌렸다고 하자. 그 뒤 다시 반년이 지나면
+Bob의 이자는4, Charlie의 이자는1이며 전체는 원금60·이자5다.
+Bob의 저장 기록이 예전 시각에 남아 있어도 **두 사람을 같은 현재 시각으로 조회한 합**은 전체와 같아야 한다.
+
+장부를 바꾸는 순서는 다음과 같다.
+
+1. 전체 원금으로 마지막 전체 기록부터 현재까지의 이자를 누적한다.
+2. 대상 개인도 자신의 마지막 기록부터 같은 현재까지 누적한다. 이 금액을 전체에 다시 더하지 않는다.
+3. 차입이면 새 원금을 더한다. 상환이면 `InterestMath.allocateRepayment`가 나눈 이자·원금을 차감한다.
+4. 이번에 새로 생긴 **전체 이자**를 반환한다. 상환의 **올림 차이**는 별도 필드로 반환한다.
+
+개인들을 순회하지 않아도 되는 이유는 같은 고정금리에서 각 원금의 기간 이자 합이 전체 원금의 기간 이자와 같기 때문이다.
+전체 원금이 바뀌기 전에 이전 구간을 계산하므로, 새 대출에 과거 이자를 붙이지 않는다.
+`accrueTotal`은 개인을 건드리지 않고 전체만 갱신한다. 같은 시각의 다음 갱신은 새 전체 이자0을 반환한다.
+
+| 내부 함수 | 입력 → 결과 | 저장 영향 |
+| --- | --- | --- |
+| `borrowerSnapshot` / `totalSnapshot` | 대상·시각 → 원금·미납 분자·정확 채권·계산 시각 | 없음 |
+| `quoteRepayment` | 사람·시각 → 원금 + 올림 미납 이자 | 없음 |
+| `totalDebtRaw` | 시각 → 전체 정확 채권의 내림 표시 | 없음 |
+| `accrueTotal` / `accrueBorrower` | 시각 / 사람·시각 → 새 전체 이자 분자 | 전체 / 전체와 개인의 미납 분자·시각 갱신 |
+| `recordBorrow` | 사람·금액·시각 → 새 전체 이자 분자 | 갱신 후 개인·전체 원금 증가 |
+| `recordRepayment` | 사람·금액·시각 → 새 전체 이자와 상환 배분 | 갱신 후 개인·전체 원금·미납 분자 차감 |
+
+### 올림해서 받은 돈과 사라진 부채는 다르다
+
+여기만 USDC 최소 단위인 **raw**로 설명한다. 원금100 raw에서 이자0.4 raw가 생긴 뒤30 raw를 갚으면
+이자 몫으로1 raw, 원금 몫으로29 raw를 받아 원금71·미납0이 된다.
+
+- 새 발생 이자: `0.4 × Q = 126_144_000_000`
+- 정산 올림 차이: `0.6 × Q = 189_216_000_000`
+
+전체 미납 이자에서 뺄 것은 실제로 사라진 **0.4 raw의 분자**다. 올려 받은1 raw 전부를 빼면 다른 사람의
+미납 이자까지 줄이거나 산술 오류가 난다. 그래서 코드는 `개인 정산 전 분자 − 정산 후 분자`를 차감한다.
+올림 차이는 기존 부채에 포함돼 있지 않았으므로 별도로 반환한다. 후속 풀은 새 발생 이자와 이 차이를 각각 한 번 반영한다.
+
+두 사람의 정확 부채가10.2 raw·10.7 raw라면 개인 완제 견적은11·11이고, 전체 정확 부채는20.9 raw다.
+`totalDebtRaw`는20을 표시한다. 개인 견적의 합22를 전체 부채로 저장하지 않는다.
+첫 사람이11로 완제하면 전체는10.7, 두 번째도11로 완제하면0이며 올림 차이는 각각0.8·0.3이다.
+최대 지불액을 정하는 `repayAll(maxAmount)`와 실제 토큰 수령은 #21에서 연결한다.
+
+### 거절과 복구
+
+- 과거 시각은 `PastTimestamp(마지막 시각, 요청 시각)`으로 거절한다. 개인 조회는 개인 기록, 전체 조회는 전체 기록을 기준으로 검사한다.
+- 차입0·상환0은 `InterestMath.ZeroAmount()`로 거절한다. 상환액이 현재 완제 견적보다 크면 `RepayExceedsDebt(견적, 요청액)`이다.
+- 원금·미납 분자·정확 채권의 필요한 곱이나 합이 `uint256`을 넘으면 `Panic(0x11)`이다.
+- 실패하면 그 호출에서 먼저 갱신한 **개인·전체 원금, 이자, 기준 시각도 모두 복구**된다.
+
+`U=uint256.max`, `K=floor(U/Q)`일 때 원금K의 배율 변환은 가능하지만 K+1은 불가능하다.
+K에 남은 표현 여유 `168_649_639_935`만큼의 미납 분자를 더하면 정확 채권U로 성공한다.
+여기서 분자1을 더하면 실패한다. 순수 계산기의 상환 견적이 나온다고 장부의 정확 채권 합산까지 가능한 것은 아니다.
+
+[DebtLedgerHarness](test/mocks/DebtLedgerHarness.sol)의 외부 래퍼·상태 조회·`seed` 함수는 테스트용이다.
+운영 라이브러리의 진입점은 모두 `internal`이며 자산 주소·토큰 전송·가격·LTV 검사를 갖지 않는다.
+기존 `LendingPool`은 아직 이 장부를 호출하지 않고 이자 없는 동작을 유지한다.
+이번 실패 복구 검사는 장부와 시각에 대한 것이다. 실제 토큰 실패·재진입 복구는 #21의 통합 검증 대상이다.
+
+<details>
+<summary>정상 장부 테스트의 준비·실행·실제 검증문 따라 읽기</summary>
+
+[DebtLedgerTest](test/DebtLedger.t.sol)는 매번 빈 하네스를 만든다. Bob·Charlie는 테스트 주소이며 토큰은 배포하지 않는다.
+수용 예시의 고정 숫자를 직접 비교하고, `_assertTotals`는 같은 시각의 개인 원금·이자·정확 채권 합을 전체와 비교한다.
+`storedBorrower` / `storedTotal`은 조회나 실패가 실제 저장값을 바꾸었는지 관측하기 위한 시험 함수다.
+
+| 테스트 | 준비·실행 | 실제 검증 |
+| --- | --- | --- |
+| `test_HalfYearSnapshotDoesNotWrite` | 시각0에40 차입, 반년 조회 | 원금40·이자2의 고정 분자·정확 채권, 개인/전체 동일, 저장 전후 전체 필드 동일 |
+| `test_RepayTwelveAfterHalfYearLeavesThirty` | 40 차입 후 반년에12 상환, 다음 반년 조회 | 새 이자2 반환, 이자2·원금10 배분, 남은30·이자0·시각 갱신, 다음 이자1.5 |
+| `test_AdditionalBorrowPreservesEarlierInterest` | 40 차입, 반년에10 추가, 다음 반년 조회 | 미납2 보존·원금50, 이후 총 미납4.5·완제 견적54.5 |
+| `test_StaggeredBorrowersMatchCurrentGlobalDebt` | Bob40, 반년 뒤 Charlie20, 다시 반년 | Bob이자4·Charlie1·전체원금60·이자5·채권65, 같은 시각 합 일치 |
+| `test_GlobalThenBorrowerOrderDoesNotDoubleCount` | 위 상태의 두 하네스, 전체 우선/개인 역순 갱신 | 새 전체 이자3을 한 번 반환, 나머지는0, 개인 보존·최종 모든 저장값 일치 |
+| `test_MonthlyAndOnceAccrualAgree` | 같은1년을12등분 갱신하거나 한 번 갱신 | 반환 합·개인/전체 저장값 동일, 같은 시각 재갱신0 |
+| `test_SubRawAccrualSurvivesCheckpoints` | 원금1 raw에서1초씩3회 갱신 | 새 분자1,000씩, 최종3,000, 전체 내림1·개인 견적2 |
+| `test_LongEmptyPeriodDoesNotAccrueBeforeBorrow` | 20년 빈 장부 갱신 후 처음40 차입 | 첫 이자0·첫 시각 저장, 이후 반년 이자2 |
+| `test_ReborrowAfterEveryoneRepaysStartsFresh` | 두 사람 완제,20년 뒤10 재차입 | 전체0 확인, 새 미납0, 이후 견적10.5, 완제한 다른 사람0 |
+| `test_InterestOnlyRepaymentKeepsPrincipal` | 원금100·1년 이자10에서3 상환 | 원금100 유지·이자7, 배분3/0·올림0, 다음 반년 총미납12 |
+| `test_FractionalRepaymentSeparatesAccrualAndSurplus` | 원금100 raw·1,261,440초 후30 상환, 같은 시각1 상환 | 새 이자0.4·올림0.6 분리, 원금71, 재상환에는 이자·올림 차이0 |
+| `test_TwoFractionalPayoffsPreserveOtherBorrower` | 시험용10.2·10.7 준비,11씩 완제 | 견적11/11·전체표시20, 정확20.9→10.7→0, 올림0.8/0.3, 다른 개인 기록 보존 |
+| `testFuzz_InterleavedOperationsConserveExactDebt` | 임의 시각·두 사람·차입/상환/갱신16회를 한 시나리오로 반복 | 매번 개인 합=전체, 새 이자 반환, 받은 금액 배분, 차입/상환/올림을 반영한 정확 채권 보존 |
+
+fuzz는 제품 조회·반환값 사이의 일관성을 보는 보조 검사다. 독립 금액 기대값은 앞의 고정12개가 검증한다.
+
+[DebtLedgerBoundsTest](test/DebtLedgerBounds.t.sol)는 모든 거절에서 Bob·Charlie·전체의 원금·미납 분자·시각
+아홉 필드를 전후 비교한다. `_prepareTwoBorrowers`는 Bob40 raw를시각10, Charlie20 raw를시각20에 기록한다.
+기본 전체 상태는 원금60·미납 분자400,000·시각20이며, Bob의시각10 기록은 그대로 남아 있다.
+
+| 테스트 | 준비·실행 | 실제 검증 |
+| --- | --- | --- |
+| `test_PastTotalTimestampRestoresEveryPosition` | 기본 상태에서 Bob을시각19로 갱신 | `PastTimestamp(20,19)`·저장 보존 |
+| `test_PastBorrowerTimestampRollsBackEarlierTotalCheckpoint` | 시험용 개인시각30·전체시각10,시각20 갱신 | 먼저 바뀐 전체도 복구, `PastTimestamp(30,20)` |
+| `test_PersonalReadsRejectPastTimestampWithoutMutation` / `test_TotalReadsRejectPastTimestampWithoutMutation` | 기본 상태의 개인 snapshot/견적, 전체 snapshot/표시를 각각 과거로 조회 | 개인 `(10,9)`, 전체 `(20,19)`의 정확 오류·저장 보존 |
+| `test_ZeroPrincipalStillRejectsPastTimestamp` | 시각10에 전액 상환 후시각9 조회·갱신 | 개인/전체0 확인, 원금0에서도 `PastTimestamp(10,9)`·저장 보존 |
+| `test_ZeroRepaymentRestoresEveryPosition` | 기본 상태에서시각30에0 상환 | `ZeroAmount`, 먼저 계산한 개인/전체 이자·시각도 복구 |
+| `test_ExcessRepaymentRestoresEveryPosition` / `test_MaximumRepaymentAmountUsesExcessDebtError` | 기본 상태에서42 또는U 상환 | 견적41을 담은 `RepayExceedsDebt`·저장 보존 |
+| `test_EmptyRepaymentRestoresUninitializedTimestamps` | 빈 장부에서시각50에1 상환 | `RepayExceedsDebt(0,1)`·개인/전체시각0 유지 |
+| `test_ZeroBorrowRestoresEveryPosition` | 기본 상태에서시각30에0 차입 | `ZeroAmount`·저장 보존 |
+| `test_MaximumRawBorrowPreservesExactNumerator` | 빈 장부에서K 차입 | 개인/전체 원금K, 정확 분자`U−168_649_639_935`·시각 보존 |
+| `test_OneAboveMaximumRawBorrowRestoresNewCheckpoints` | 전체만시각10 기록 후시각20에K+1 차입 | 배율 곱 `Panic(0x11)`, 먼저 바뀐 기준 시각까지 복구 |
+| `test_ExactDebtAtMaximumNumeratorSucceeds` | 원금1·미납`U−Q−1,000`에서1초 갱신 | 새분자1,000, 개인/전체 정확 채권U, 개인 견적K+1·전체 표시K |
+| `test_ExactDebtSumOverflowRejectsReadsAndAccrual` | 원금1·미납`U−Q`에서1초 뒤 조회·갱신 | 미납만으로는 유효해도 정확 채권 합은 `Panic(0x11)`·저장 보존 |
+| `test_TotalExactDebtSumOverflowRestoresNewCheckpoints` | 일치하는 두 개인/전체의 큰 미납 상태에서1 추가 차입 | 개인별 범위 안, 전체 채권 합 초과는 `Panic(0x11)`·두 기준 시각 복구 |
+| `test_AccrualPrincipalTimeProductOverflowRestoresState` / `test_AccrualRateProductOverflowRestoresState` | 원금2·기간U/2+1 또는 원금1·기간U/1,000+1 | 시간 곱/금리 곱의 `Panic(0x11)`·저장 보존 |
+| `test_AccrualInterestAdditionOverflowRestoresState` | 원금1·미납`U−Q`에서315,360,001초 경과 | 유효한 새 분자를 더한 합은 `Panic(0x11)`·저장 보존 |
+| `test_PersonalPrincipalAdditionOverflowRestoresNewCheckpoints` / `test_TotalPrincipalAdditionOverflowRestoresPersonalWrite` | 기존 원금에U 추가 / Bob1을 둔 채 Charlie에게U 차입 기록 | 개인 원금합/전체 원금합의 `Panic(0x11)`, 선행 개인 대입·갱신까지 복구 |
+
+개인 시각이 전체보다 앞선 경우는 정상 API로 만들 수 없으므로 해당 검사만 불일치 fixture를 사용한다.
+임의 분자 끝자리와 최댓값 fixture는 개인 합·전체가 일치하도록 준비한다. 시험용 setter는 실제 운영 API에 없다.
+
+로컬 실행: 장부33개(정상13·경계20), 전체274개·실패0·skip0을 확인했다.
+`forge test --match-contract 'DebtLedger(Test|BoundsTest)' -vv`, `forge fmt --check`, `forge build`,
+`forge test -vv`를 실행했다. 원격 PR CI는 아직 실행하지 않았다.
+
+</details>
+
+## 기반 계산기: 연10%를 상수로 읽고 같은 이자를 계산한다
 
 #19에서 만든 [InterestMath](src/libraries/InterestMath.sol)는 **이자를 계산하고 상환액을 나누는 계산기**다.
 #23에서는 분모에 합쳐 두었던 연10%를 `ANNUAL_RATE_BPS` 상수로 분리했다. 이자 금액과 상환 규칙은 같다.
@@ -28,7 +171,7 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 | `DENOMINATOR` (Q) | 315,360,000,000 | `YEAR_SECONDS × RATE_SCALE` |
 
 금리 상수는 `accrue`의 실제 누적식에서 사용한다. 금리를 입력받거나 운영 중 바꾸는 기능은 없다.
-실제 풀은 아직 원금만 빌리고 갚는다. 이 계산 결과를 저장하는 장부는 [#20](https://github.com/0Chord/lending-protocol/issues/20),
+실제 풀은 아직 원금만 빌리고 갚는다. #20의 장부는 이 계산 결과를 저장하며 테스트 하네스에서 사용한다.
 공급자 자산·실제 상환·`repayAll` 연결은 [#21](https://github.com/0Chord/lending-protocol/issues/21)에서 다룬다.
 
 ### 작은 이자를 남겨 두는 방법
@@ -57,7 +200,7 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 바로 나누지 않으므로 원금1 raw를3초 유지한 결과와1초씩 세 번 계산한 결과가 모두 분자3,000이다.
 시간 구간을 쪼갰다는 이유로 소수 이자가 사라지지 않는다. 원금과 경과초를 먼저 곱하므로 둘 중0이면
 다른 입력이 최댓값이어도 기존 분자를 보존한다.
-이 함수는 경과초를 입력받는다. 실제 시각을 읽거나 마지막 계산 시각을 저장하는 책임은 후속 장부에 있다.
+이 함수는 경과초를 입력받는다. 마지막 계산 시각은 위 DebtLedger가 저장하며, 실제 풀 연결 시 호출자는 블록 시각을 전달한다.
 이미 정수 금액인 raw를 분자로 바꾸는 `toNumerator`는 `raw × Q`만 계산하며 금리를 다시 곱하지 않는다.
 
 | 함수 | 입력 → 반환 | 경계 |
@@ -86,7 +229,7 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 반환하는 `Repayment`의 `remainingPrincipal`, `interestPaid`, `principalPaid`는 raw이고,
 `remainingInterestNumerator`, `roundingSurplusNumerator`는 정확 분자다.
 표의0.4 raw는 분자`126_144_000_000`, 올림 차이0.6 raw는 분자`189_216_000_000`으로 반환한다.
-이 차이는 후속 장부에서 공급자 수익으로 반영할 값이다. 계산기 자체는 자산·현금·부채 기록을 바꾸지 않는다.
+이 차이는 장부가 별도로 반환하고 후속 풀에서 공급자 수익으로 반영할 값이다. 계산기 자체는 자산·현금·부채 기록을 바꾸지 않는다.
 
 정산이 끝난 미납 분자는0이므로 다음 상환에 같은 이자를 다시 청구하지 않는다.
 다만 **새로 생긴 작은 이자를 여러 번 정산하면 올림 비용도 여러 번 생긴다.** 원금4 raw에서 반년 이자0.2 raw를
@@ -106,10 +249,10 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 `U = uint256.max`, `K = floor(U/Q)`라면 `K × Q`는 표현 가능하지만 `(K+1) × Q`는 불가능하다.
 새 Q는 기존의1,000배이므로 분자로 표현 가능한 실제 금액의 상한은 줄어든다. 같은 uint256 안에
 더 큰 배율로 담는 데 따른 한계이며, 두 표현에서 모두 허용되는 정상 금액의 이자는 동일하다.
-분자U 자체의 내림K·올림K+1과 순수 상환 배분은 성공할 수 있다. 이를 후속 장부의 모든 자산 합산도
+분자U 자체의 내림K·올림K+1과 순수 상환 배분은 성공할 수 있다. 이를 장부의 모든 정확 채권 합산도
 성공한다는 뜻으로 해석하지 않는다. 기존 [ShareMath](src/libraries/ShareMath.sol)의 큰 중간 곱 처리 계약은 그대로다.
 정상 누적으로 생긴 분자는1,000의 배수지만 변환·견적·상환은 그 밖의 uint256 분자도 받는다.
-기존 운영 장부의 분자를 이전하는 기능은 없으며, 후속 장부·풀은 처음부터 새 단위를 사용한다.
+기존 운영 장부의 분자를 이전하는 기능은 없으며, DebtLedger와 후속 풀은 처음부터 새 단위를 사용한다.
 
 <details>
 <summary>이자 테스트35개의 준비·실행·실제 검증문 따라 읽기</summary>
