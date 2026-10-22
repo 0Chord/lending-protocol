@@ -20,9 +20,18 @@ library InterestMath {
     /// @notice 완제 견적보다 큰 요청은 일부 배분 없이 거절한다.
     error RepayExceedsDebt(uint256 debt, uint256 requested);
 
-    /// @notice 이자 분자를 나누면 USDC 최소 단위 금액이 되는 고정 분모다.
-    /// @dev 원금 × 경과초 / (365일 × 10)으로 연10% 단리를 계산한다.
-    uint256 internal constant DENOMINATOR = 315_360_000;
+    /// @notice 윤년과 무관하게 365일을 한 해로 계산한다.
+    uint256 internal constant YEAR_SECONDS = 365 days;
+
+    /// @notice 금리의 100%를 나타내는 기준이며 USDC 소수점 배율과 다르다.
+    uint256 internal constant RATE_SCALE = 10_000;
+
+    /// @notice 1,000/10,000인 연10%를 고정 적용하며 운영 중 변경하지 않는다.
+    uint256 internal constant ANNUAL_RATE_BPS = 1_000;
+
+    /// @notice 이자 분자를 나누면 USDC 최소 단위 금액이 되는 환산 기준이다.
+    /// @dev 분자는 원금 × 경과초 × 연이율이며 금리값 자체를 분모에 넣지 않는다.
+    uint256 internal constant DENOMINATOR = YEAR_SECONDS * RATE_SCALE;
 
     /// @notice USDC 최소 단위 금액을 정확한 분자 단위로 올려 표현한다.
     /// @dev 변환 결과가 uint256을 넘으면 Panic(0x11)이며 끝자리를 버리지 않는다.
@@ -79,7 +88,7 @@ library InterestMath {
     }
 
     /// @notice 남은 원금에 대한 기간 이자를 기존 미납 이자 분자에 더한다.
-    /// @dev 미납 이자는 원금에 합치지 않으며 곱·합의 범위 초과는 Panic(0x11)이다.
+    /// @dev 원금과 경과초를 먼저 곱해 둘 중0이면 분자를 보존한다. 곱·합 초과는 Panic(0x11)이다.
     /// @param principal USDC 최소 단위의 남은 원금
     /// @param interestNumerator 기존 미납 이자의 정확한 분자
     /// @param elapsedSeconds 원금이 유지된 기간의 초 수
@@ -89,6 +98,6 @@ library InterestMath {
         pure
         returns (uint256)
     {
-        return interestNumerator + principal * elapsedSeconds;
+        return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
     }
 }
