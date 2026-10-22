@@ -9,9 +9,118 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#11](https://github.com/0Chord/lending-protocol/issues/11)의 테스트용 MockWBTC와
 [#12](https://github.com/0Chord/lending-protocol/issues/12)의 Mock 가격·담보 가치/한도 계산과
 [#13](https://github.com/0Chord/lending-protocol/issues/13)의 본인 WBTC 담보 입금·반환과
-[#14](https://github.com/0Chord/lending-protocol/issues/14)의 이자 없는 담보대출·상환 연결이다. 테스트 전용 학습 프로젝트다.
+[#14](https://github.com/0Chord/lending-protocol/issues/14)의 이자 없는 담보대출·상환 연결과
+[#19](https://github.com/0Chord/lending-protocol/issues/19)의 순수 이자 계산이다. 테스트 전용 학습 프로젝트다.
 
-## 이번에 읽을 동작: 담보로 빌린 원금을 갚고 담보를 돌려받는다
+## 이번에 읽을 동작: 원금40의 반년 이자2를 계산한다
+
+#19는 **이자를 계산하고 상환액을 나누는 계산기**다. [InterestMath](src/libraries/InterestMath.sol)에
+원금40 USDC와 반년을 넣으면 이자2가 나온다. 이어12를 갚는 계산을 하면 이자2·원금10으로 나누고 원금30을 남긴다.
+그 뒤1년의 이자는 남은 원금30의10%인3이다. 미납 이자에는 다시 이자를 붙이지 않는 단리다.
+
+실제 풀은 아직 원금만 빌리고 갚는다. 이 계산 결과를 저장하는 장부는 [#20](https://github.com/0Chord/lending-protocol/issues/20),
+공급자 자산·실제 상환·`repayAll` 연결은 [#21](https://github.com/0Chord/lending-protocol/issues/21)에서 다룬다.
+
+### 작은 이자를 남겨 두는 방법
+
+USDC는 소수점6자리이므로 계약에서 `1 USDC = 1_000_000 raw`다. 여기서 raw는 토큰의 최소 단위다.
+그보다 작은 이자도 사라지지 않도록 **나누기 전의 분자 `N`**을 보존한다.
+
+```text
+연10% · 365일 기준: Q = 31,536,000초 × 10 = 315,360,000
+이자(raw) = 원금(raw) × 경과초 / Q
+
+원금40 USDC · 반년:
+N = 40,000,000 × 15,768,000 = 630,720,000,000,000
+N / Q = 2,000,000 raw = 2 USDC
+```
+
+`accrue`는 기존 미납 분자에 `원금 × 경과초`를 더한다. 바로 나누지 않으므로 원금1 raw를3초 유지한 결과와
+1초씩 세 번 계산한 결과가 모두 분자3이다. 시간 구간을 쪼갰다는 이유로 소수 이자가 사라지지 않는다.
+이 함수는 경과초를 입력받는다. 실제 시각을 읽거나 마지막 계산 시각을 저장하는 책임은 후속 장부에 있다.
+
+| 함수 | 입력 → 반환 | 경계 |
+| --- | --- | --- |
+| `accrue(P, N, seconds)` | 남은 원금·기존 미납 분자·기간 → 새 미납 분자 | 원금0 또는 기간0이면 기존 분자 유지; 미납 이자에는 이자를 붙이지 않음 |
+| `toNumerator(raw)` | raw → `raw × Q` | 정확한 곱이 uint256에 들어가야 함 |
+| `toRawDown(N)` / `toRawUp(N)` | 분자 → 내림/올림한 raw | 분자0은 둘 다0; 최대 분자도 몫·나머지로 계산 가능 |
+| `quoteDebt(P, N)` | 남은 원금·미납 분자 → `P + ceil(N/Q)` | 실제로 완제할 금액의 견적이며 기록이나 수익을 바꾸지 않음 |
+| `allocateRepayment(P, N, amount)` | 부채·상환액 → 남은 부채와 이자/원금 배분 | 요청0과 견적 초과는 거절; 이자를 먼저 갚음 |
+
+### 상환액은 이자부터 갚는다
+
+`allocateRepayment`는 먼저 요청0을 거절하고, 완제 견적보다 큰 요청도 거절한다.
+상환액이 올림한 미납 이자보다 작으면 전부 이자에서 빼고 원금은 유지한다.
+이자를 전부 정리할 수 있으면 이자를 최소 단위까지 올려 받고, 남은 금액만 원금에서 뺀다.
+
+| 준비 | 상환액 | 남은 원금 / 미납 이자 | 받은 이자 / 원금 | 올림 차이 |
+| --- | ---: | --- | --- | ---: |
+| 원금100 USDC·이자10 USDC | 30 USDC | 80 / 0 USDC | 10 / 20 USDC | 0 |
+| 원금100 USDC·이자10 USDC | 3 USDC | 100 / 7 USDC | 3 / 0 USDC | 0 |
+| 원금100 raw·이자1.4 raw | 1 raw | 100 / 0.4 raw | 1 / 0 raw | 0 |
+| 원금100 raw·이자1.4 raw | 2 raw | 100 / 0 raw | 2 / 0 raw | 0.6 raw |
+| 원금100 raw·이자0.4 raw | 30 raw | 71 / 0 raw | 1 / 29 raw | 0.6 raw |
+| 원금100 raw·이자0.4 raw | 101 raw | 0 / 0 raw | 1 / 100 raw | 0.6 raw |
+
+반환하는 `Repayment`의 `remainingPrincipal`, `interestPaid`, `principalPaid`는 raw이고,
+`remainingInterestNumerator`, `roundingSurplusNumerator`는 정확 분자다.
+표의0.4 raw는 분자`126_144_000`, 올림 차이0.6 raw는 분자`189_216_000`으로 반환한다.
+이 차이는 후속 장부에서 공급자 수익으로 반영할 값이다. 계산기 자체는 자산·현금·부채 기록을 바꾸지 않는다.
+
+정산이 끝난 미납 분자는0이므로 다음 상환에 같은 이자를 다시 청구하지 않는다.
+다만 **새로 생긴 작은 이자를 여러 번 정산하면 올림 비용도 여러 번 생긴다.** 원금4 raw에서 반년 이자0.2 raw를
+두 번 정산하면 실제 이자는 총2 raw를 받는다.1년 이자0.4 raw를 한 번 정산하면1 raw를 받는다.
+견적 조회나 기간 계산만으로 이 비용을 기록하지는 않는다.
+
+### 잘못된 입력과 너무 큰 계산
+
+상환0은 `ZeroAmount()`, 부채0에 양수 상환하거나 견적을 넘으면 `RepayExceedsDebt(견적, 요청액)`이다.
+예를 들어 원금100 raw·이자0.4 raw에서102 raw 요청은 `RepayExceedsDebt(101, 102)`로 거절한다.
+최대 정수를 요청해도 불필요한 배율 곱을 먼저 하지 않아 같은 초과상환 오류로 구분한다.
+
+필요한 분자 곱·분자 합·원금과 올림 이자의 합이 `uint256`을 넘으면 `Panic(0x11)`이다.
+값을 잘라내거나 최대값으로 바꾸지 않는다. 반면 올림은 `N + Q - 1`을 미리 더하지 않고 몫과 나머지로 구한다.
+올림 차이도 `Q - 나머지`로 구하므로 큰 완제액 전체에Q를 곱할 필요가 없다.
+
+`U = uint256.max`, `K = floor(U/Q)`라면 `K × Q`는 표현 가능하지만 `(K+1) × Q`는 불가능하다.
+분자U 자체의 내림K·올림K+1과 순수 상환 배분은 성공할 수 있다. 이를 후속 장부의 모든 자산 합산도
+성공한다는 뜻으로 해석하지 않는다. 기존 [ShareMath](src/libraries/ShareMath.sol)의 큰 중간 곱 처리 계약은 그대로다.
+
+<details>
+<summary>새 테스트33개의 준비·실행·실제 검증문 따라 읽기</summary>
+
+모두 [InterestMathTest](test/InterestMath.t.sol)에 있다. `setUp`은 오류를 외부 호출 경계에서 관측할
+`InterestMathHarness`만 배포한다. 정상 계산은 라이브러리를 직접 호출하며, 하네스는 계산을 복제하지 않고 전달한다.
+토큰·가격 원천·풀은 배포하지 않는다. 아래 테스트명은 공통 접두어 `test_`를 생략했다.
+
+| 테스트 | 준비 → 실행 | 실제로 비교하는 값 |
+| --- | --- | --- |
+| `FortyForHalfYearAccruesTwo`, `OneAndTwoYearsRemainSimpleInterest` | 원금40 USDC, 반년/1년/2년 → 누적 | 이자2/4/8 USDC에 해당하는 고정 분자 |
+| `UnpaidInterestDoesNotEarnInterest`, `ZeroPrincipalOrTimePreservesExistingInterest` | 기존 이자10·원금40의1년, 또는 원금/기간0 → 누적 | 이자14, 또는 기존 분자 그대로; 미납 이자의 복리 없음 |
+| `SplittingTimePreservesSubRawInterest` | 원금1 raw를1초씩 세 번 또는3초 한 번 → 누적 | 두 결과 모두 분자3; 이후0초도3 |
+| `AccrualAcceptsMaximumNumerator`, `AccrualProductOverflowReverts`, `AccrualAdditionOverflowReverts` | 최대값에 닿는 곱/합과 각각 넘는 곱/합 → 누적 | 허용 결과U, 초과는 정확한 `Panic(0x11)` |
+| `DebtQuoteRoundsOnlyUnpaidInterestUp`, `QuoteAtOneRawInterestBoundary` | 원금100·이자0.4 raw 견적, 원금1 raw·Q−1/Q/Q+1초 누적 후 견적 | 101, 정확 분자Q−1/Q/Q+1과 견적2/2/3 |
+| `ExactAndZeroConversionsDoNotAddRounding`, `SubRawInterestHasDifferentFloorAndCeil` | 0·정수2 USDC·소수0.4 raw → 배율/내림/올림·견적 | 정수와0은 그대로, 소수는 내림0·올림1 |
+| `MaximumNumeratorCanBeRounded`, `NumeratorConversionHasExplicitUpperBound`, `DebtQuoteAdditionOverflowReverts` | N=U·K/K+1 배율, 원금+올림 이자 합 경계 → 변환·견적 | U의 나머지247,399,935·내림K·올림K+1; 배율/견적 초과만 정확한 산술 오류 |
+| `RepaymentPaysInterestBeforePrincipal`, `PartialInterestPaymentPreservesPrincipal`, `ExactInterestOnlyPaymentPreservesPrincipal` | 원금100·이자10 USDC에서30/3/10 상환 계산 | 남은 원금80/100/100·이자0/7/0; 지급 배분·올림 차이까지 다섯 필드 비교 |
+| `AccrualAfterRepaymentUsesReducedPrincipal` | 40·반년 누적 →12 상환 → 다음1년 누적 | 이자2, 원금30·이자0·지급2/10·차이0, 다음 이자3의 고정 분자 |
+| `NoInterestPaymentOnlyReducesPrincipal` | 원금100 raw·이자0 →40 상환 | 남은 원금60, 지급 이자0·원금40, 나머지 필드0 |
+| `PartialFractionalInterestKeepsRemainder`, `ClearingFractionalInterestOnlyRoundsOnce` | 원금100 raw·이자1.4 raw →1/2 상환 | 부분 상환은 분자126,144,000 유지; 정산은 분자0·차이189,216,000 |
+| `FractionalInterestSettlementThenPrincipal`, `FullRepaymentClearsPrincipalAndInterest` | 원금100 raw·이자0.4 raw →30/101 상환 | 원금71/0, 미납0, 이자 지급1·원금 지급29/100·차이189,216,000 |
+| `SettledInterestIsNotChargedAgain` | 소수 이자 정산 반환값으로 다시1 raw 상환 | 두 번째는 원금만1 차감, 이자 지급·미납·차이 모두0 |
+| `SeparateSettlementsCanAccumulateRounding` | 원금4 raw의 반년 이자 두 번 / 1년 한 번 → 각각 정산 | 실제 이자2/1 raw; 올림 차이 총분자504,576,000/189,216,000 |
+| `ZeroRepaymentRevertsBeforeQuote`, `NoDebtRepaymentReverts`, `ExcessRepaymentRevertsBeforeScalingRequest`, `RepaymentPropagatesQuoteOverflow` | 요청0·부채0·견적+1/최대 요청·견적 합 초과 → 배분 | 각각 정확한0/초과상환 오류와 인수, 또는 `Panic(0x11)`; 부수 산술 오류로 거절 이유를 숨기지 않음 |
+| `PartialMaximumInterestPreservesExactRemainder`, `MaximumInterestSettlementAvoidsUnneededMultiplication`, `MaximumPrincipalSettlementDoesNotScalePayment` | 최대 분자 일부/전부, 이자 없는 최대 원금 → 상환 | 나머지247,399,935 / 완제 차이67,960,065 / 원금 전액 지급; 다섯 필드 비교 |
+
+상환 결과는 공통 `_assertRepayment`가 다섯 필드를 각각 비교한다. 기대값은 계산 함수의 결과를 다시 정답으로 쓰지 않고
+명세의 고정 금액·분자에서 정했다. 이 검증은 순수 계산과 오류 경계이며, 토큰 전송·상태 복구·실제 시각 갱신은 후속 범위다.
+
+새 계산 검사는 `forge test --match-contract InterestMathTest -vv`로 실행한다.
+기존 CI와 같은 전체 검사는 `forge fmt --check`, `forge build`, `forge test -vv`다.
+
+</details>
+
+## #14에서 익힌 동작: 담보로 빌린 원금을 갚고 담보를 돌려받는다
 
 #14는 **공급 지분·WBTC 담보·USDC 원금 부채를 별도로 기록**한다. 공급자는 `supply`로 지분을 받고,
 차입자는 `depositCollateral`로 담보를 맡긴 뒤 `borrow`로 USDC를 받는다. `repay`는 본인 원금만 줄이며,
@@ -699,7 +808,6 @@ function withdraw(uint256 amount) external nonReentrant {
 
 ### 왜 먼저 줄인 예치가 전송 실패 때 복구되는가
 
-사용자가 먼저 함께 확인하고 싶다고 답한 부분은 전송 실패 시 예치 복구다.
 예치 차감과 토큰 호출은 하나의 withdraw 실행 안에 있다. 풀에서 오류를 잡고 성공으로 바꾸지 않으므로
 오류가 호출자까지 전파되면 그 출금에서 바뀐 예치 기록과 하위 토큰 호출의 상태가 모두 되돌아간다.
 앞선 별도 거래의 공급 100은 취소되지 않는다.
@@ -901,7 +1009,7 @@ assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
 MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이다.
 토큰 발행에는 실제 자산 입금이 없으며, 풀의 예치 권리를 만들지 않는다.
 풀은 대출 자산 MockUSDC6·담보 MockWBTC8·Mock 가격 원천8을 배포 때 고정한다. 본인 공급·출금·담보 입금/반환·원금 대출/상환을 다룬다.
-자산 변경·대리 공급/차입/상환·수령자 지정·이자·청산·잉여 회수·구제 함수는 없다. 가격 하락만으로 부채를 삭제하거나 손실을 보전하지 않는다.
+자산 변경·대리 공급/차입/상환·수령자 지정·풀의 이자 누적·청산·잉여 회수·구제 함수는 없다. #19의 순수 이자 계산은 아직 풀에 연결하지 않았다. 가격 하락만으로 부채를 삭제하거나 손실을 보전하지 않는다.
 실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다. 배포는 이번 작업 범위에 포함하지 않는다.
 
 풀에 직접 전송·발행한 토큰은 예치 권리를 만들지 않는다. 직접 전송 10 후 정상 공급 100이면 풀 현금은 110이고 예치 권리는 100이다.
@@ -910,7 +1018,8 @@ MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이�
 재진입 검증도 임의의 악성 자산 지원을 의미하지 않는다. 실제 외부 서비스·시장가격의 정확성은 이번 로컬 Mock 범위 밖이다.
 
 테스트는 단위 연결·공급 권리·담보·원금 부채·공통 재원의 정상·거절·전송 실패와 대표 재진입 경로를 다룬다.
-작성된 사례·실제 실행 결과·독립 검토 완료는 구분하며, 로컬206개 통과를 사용자 이해나 독립 리뷰 완료로 읽지 않는다.
+#19에서는 이와 별도로 단리 누적·완제 견적·이자 우선 배분·정산 올림·산술 범위를 검증한다.
+작성된 사례·실제 실행 결과·독립 검토 완료는 구분하며, 로컬 검사 통과를 사용자 이해나 독립 리뷰 완료로 읽지 않는다.
 OpenZeppelin의 모든 ERC20 동작이나 실제 USDC 연동을 검증하는 범위는 아니다.
 생성되는 `out/`, `cache/`, `broadcast/`는 버전 관리에서 제외한다.
 
