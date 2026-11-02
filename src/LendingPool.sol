@@ -5,15 +5,18 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {DebtLedger} from "./accounting/DebtLedger.sol";
+import {InterestMath} from "./libraries/InterestMath.sol";
 import {ShareMath} from "./libraries/ShareMath.sol";
 import {CollateralMath} from "./libraries/CollateralMath.sol";
 import {ICollateralPriceSource} from "./interfaces/ICollateralPriceSource.sol";
 
-/// @title WBTC 담보로 USDC 원금을 빌리고 갚는 학습 풀
+/// @title WBTC 담보 대출의 단리 이자를 공급자 권리에 반영하는 학습 풀
 /// @notice 공급 지분·WBTC 담보·USDC 부채를 분리하고 정상 공급분의 현금만 지급한다.
-/// @dev 고정6/8/8 Mock 자산·가격의 로컬 학습 단계이며 이자·청산·실제 오라클은 제외한다.
+/// @dev 고정6/8/8 Mock 자산·가격과 연10% 단리의 로컬 학습 단계이며 청산·실제 오라클은 제외한다.
 contract LendingPool is ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using DebtLedger for DebtLedger.State;
 
     /// @notice 배포 때 고정한 공급 자산이다.
     IERC20 public immutable asset;
@@ -23,16 +26,14 @@ contract LendingPool is ReentrancyGuard {
     ICollateralPriceSource public immutable priceSource;
     /// @notice 정상 담보 입금으로 인정한 주소별 원시 수량이다.
     mapping(address => uint256) internal _collateralBalances;
-    /// @notice 직접 전송·발행과 구분해 장부에서 인정한 USDC 자산이다.
-    uint256 internal _accountedAssets;
+    /// @notice 공급자 인정자산을 이자 분자 단위로 보관하며 직접 유입은 포함하지 않는다.
+    uint256 internal _accountedAssetsNumerator;
     /// @notice 공급자의 지분 최소 단위 수량의 합이다.
     uint256 public totalShares;
     /// @notice 전송 가능한 토큰과 구분한 주소별 내부 지분이다.
     mapping(address => uint256) public shares;
-    /// @notice 주소별 미상환 USDC 원금이며 공급 지분·담보와 별도로 기록한다.
-    mapping(address => uint256) public debtOf;
-    /// @notice 모든 사용자의 미상환 USDC 원금 합계다.
-    uint256 public totalDebt;
+    /// @notice 개인과 전체의 원금·미납 이자·기준 시각을 같은 단위로 기록한다.
+    DebtLedger.State internal _debtLedger;
 
     /// @notice 실제 전송에 성공한 공급의 주체와 최소 단위 수량을 알린다.
     event Supplied(address indexed user, uint256 amount);
@@ -49,13 +50,19 @@ contract LendingPool is ReentrancyGuard {
     /// @notice 본인에게 지급한 USDC 대출 원금을 알린다.
     event Borrowed(address indexed user, uint256 amount);
 
-    /// @notice 실제 수령한 본인 USDC 상환 원금을 알린다.
+    /// @notice 실제 수령한 본인 USDC 상환액을 이자와 원금의 합으로 알린다.
     event Repaid(address indexed user, uint256 amount);
 
     /// @notice 본인 부채보다 많은 상환은 일부 수령 없이 거절한다.
     error RepayExceedsDebt(uint256 debt, uint256 requested);
 
-    /// @notice 원금이 남은 동안 담보는 일부도 반환할 수 없다.
+    /// @notice 전액 상환할 원금과 미납 이자가 모두 없으면 거절한다.
+    error NoDebt();
+
+    /// @notice 실행 시 완제 금액이 사용자가 정한 최대 지급액을 넘으면 거절한다.
+    error RepaymentLimitExceeded(uint256 debt, uint256 maxAmount);
+
+    /// @notice 원금이나 미납 이자가 남으면 담보는 일부도 반환할 수 없다.
     error OutstandingDebt(uint256 debt);
 
     /// @notice 이번 요청까지 포함한 총부채가 담보 한도를 넘으면 거절한다.
@@ -64,7 +71,7 @@ contract LendingPool is ReentrancyGuard {
     /// @notice 총부채가 인정자산보다 큰 손상 장부를 현금 부족으로 숨기지 않는다.
     error InvalidDebtAccounting(uint256 accountedAssets, uint256 totalDebt);
 
-    /// @notice 여섯 자금 이동 진입점 모두 0 요청을 유효한 동작으로 취급하지 않는다.
+    /// @notice 일곱 자금 이동 진입점 모두 0 요청을 유효한 동작으로 취급하지 않는다.
     error ZeroAmount();
 
     /// @notice 양수 공급으로 지분을 받지 못하면 토큰을 받지 않고 거절한다.
@@ -157,7 +164,7 @@ contract LendingPool is ReentrancyGuard {
     /// @param amount 소수점 8자리 WBTC 최소 단위 수량
     function withdrawCollateral(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        uint256 debt = debtOf[msg.sender];
+        uint256 debt = debtOf(msg.sender);
         if (debt != 0) revert OutstandingDebt(debt);
         uint256 deposited = _collateralBalances[msg.sender];
         if (amount > deposited) revert InsufficientCollateral(deposited, amount);
@@ -168,13 +175,17 @@ contract LendingPool is ReentrancyGuard {
 
     /// @notice 실제 토큰 현금과 구분한 인정자산의 최소 단위 수량을 반환한다.
     function totalAssets() external view returns (uint256) {
-        return _accountedAssets;
+        return InterestMath.toRawDown(_currentAssetsNumerator());
     }
 
     /// @notice 직접 유입 잉여와 이미 빌려준 원금을 제외한 지급 가능 USDC를 반환한다.
     function availableLiquidity() public view returns (uint256) {
-        if (totalDebt > _accountedAssets) revert InvalidDebtAccounting(_accountedAssets, totalDebt);
-        uint256 remaining = _accountedAssets - totalDebt;
+        uint256 assetsNumerator = _currentAssetsNumerator();
+        uint256 debtNumerator = _debtLedger.totalSnapshot(block.timestamp).debtNumerator;
+        if (debtNumerator > assetsNumerator) {
+            revert InvalidDebtAccounting(InterestMath.toRawDown(assetsNumerator), InterestMath.toRawDown(debtNumerator));
+        }
+        uint256 remaining = InterestMath.toRawDown(assetsNumerator - debtNumerator);
         uint256 cash = asset.balanceOf(address(this));
         return cash < remaining ? cash : remaining;
     }
@@ -184,36 +195,50 @@ contract LendingPool is ReentrancyGuard {
     /// @param amount 소수점6자리 USDC 최소 단위 수량
     function borrow(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
+        _accrueInterest();
         (int256 price, uint256 updatedAt) = priceSource.latestPrice();
         uint256 limit = CollateralMath.maxDebtDown(_collateralBalances[msg.sender], price, updatedAt, block.timestamp);
-        uint256 debt = debtOf[msg.sender];
+        uint256 debt = debtOf(msg.sender);
         if (debt > limit || amount > limit - debt) revert BorrowLimitExceeded(limit, debt, amount);
         uint256 available = availableLiquidity();
         if (amount > available) revert InsufficientLiquidity(available, amount);
-        debtOf[msg.sender] = debt + amount;
-        totalDebt += amount;
+        _accountedAssetsNumerator += _debtLedger.recordBorrow(msg.sender, amount, block.timestamp);
         asset.safeTransfer(msg.sender, amount);
         emit Borrowed(msg.sender, amount);
     }
 
-    /// @notice 승인한 USDC를 실제 수령한 뒤 본인의 미상환 원금만 줄인다.
+    /// @notice 현재 이자를 먼저 반영하고 실제 수령액을 미납 이자·원금 순으로 차감한다.
     /// @dev 가격을 읽지 않으며 전송 실패 시 승인·토큰·부채를 모두 복구한다.
     /// @param amount 소수점6자리 USDC 최소 단위 수량
     function repay(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        uint256 debt = debtOf[msg.sender];
+        _accrueInterest();
+        uint256 debt = debtOf(msg.sender);
         if (amount > debt) revert RepayExceedsDebt(debt, amount);
-        asset.safeTransferFrom(msg.sender, address(this), amount);
-        debtOf[msg.sender] = debt - amount;
-        totalDebt -= amount;
-        emit Repaid(msg.sender, amount);
+        _receiveRepayment(amount);
+    }
+
+    /// @notice 실행 시 완제 금액이 상한 이하이면 그 금액만 받아 부채를 모두 정리한다.
+    /// @dev 가격을 읽지 않으며 수령·정산 실패는 이자·시각·토큰·승인까지 복구한다.
+    /// @param maxAmount 소수점6자리 USDC 최소 단위로 정한 최대 지급액
+    function repayAll(uint256 maxAmount) external nonReentrant {
+        if (maxAmount == 0) revert ZeroAmount();
+        uint256 debt = debtOf(msg.sender);
+        if (debt == 0) revert NoDebt();
+        if (debt > maxAmount) revert RepaymentLimitExceeded(debt, maxAmount);
+        _accrueInterest();
+        _receiveRepayment(debt);
     }
 
     /// @notice 본인 지분의 USDC 가치를 최소 단위에서 내려 반환한다.
     /// @dev 지분0 주소도 잘못된 장부를 숨기지 않고 계산 모듈의 오류를 전파한다.
     /// @param user 환산할 지분의 소유자
     function deposits(address user) public view returns (uint256) {
-        return ShareMath.toAssetsDown(shares[user], _accountedAssets, totalShares);
+        uint256 assetsNumerator = _currentAssetsNumerator();
+        _checkShareAccounting(assetsNumerator);
+        if (totalShares == 0) return shares[user];
+        // 분자 지분을 먼저 내리고 마지막에 USDC로 내려도 최종 내림값은 같다.
+        return InterestMath.toRawDown(ShareMath.toAssetsDown(shares[user], assetsNumerator, totalShares));
     }
 
     /// @notice 공급 전 비율로 받을 지분을 계산하고 토큰 전송 뒤 기록한다.
@@ -221,10 +246,11 @@ contract LendingPool is ReentrancyGuard {
     /// @param amount 소수점 6자리가 적용된 정수 최소 단위 수량
     function supply(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        uint256 mintedShares = ShareMath.toSharesDown(amount, _accountedAssets, totalShares);
+        _accrueInterest();
+        uint256 mintedShares = _sharesForAssets(amount, false);
         if (mintedShares == 0) revert ZeroShares();
         asset.safeTransferFrom(msg.sender, address(this), amount);
-        _accountedAssets += amount;
+        _accountedAssetsNumerator += InterestMath.toNumerator(amount);
         totalShares += mintedShares;
         shares[msg.sender] += mintedShares;
         emit Supplied(msg.sender, amount);
@@ -235,18 +261,69 @@ contract LendingPool is ReentrancyGuard {
     /// @param amount 소수점 6자리가 적용된 정수 최소 단위 수량
     function withdraw(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
+        _accrueInterest();
         uint256 deposited = deposits(msg.sender);
         if (amount > deposited) revert InsufficientDeposit(deposited, amount);
         uint256 available = availableLiquidity();
         if (amount > available) revert InsufficientLiquidity(available, amount);
 
-        uint256 burnedShares = ShareMath.toSharesUp(amount, _accountedAssets, totalShares);
-        uint256 remainingAssets = _accountedAssets - amount;
-        if (burnedShares == totalShares && remainingAssets != 0) revert ResidualAssets(remainingAssets);
-        _accountedAssets = remainingAssets;
+        uint256 burnedShares = _sharesForAssets(amount, true);
+        uint256 remainingAssets = _accountedAssetsNumerator - InterestMath.toNumerator(amount);
+        if (burnedShares == totalShares && remainingAssets != 0) {
+            revert ResidualAssets(InterestMath.toRawUp(remainingAssets));
+        }
+        _accountedAssetsNumerator = remainingAssets;
         totalShares -= burnedShares;
         shares[msg.sender] -= burnedShares;
         asset.safeTransfer(msg.sender, amount);
         emit Withdrawn(msg.sender, amount);
+    }
+
+    /// @notice 현재 시각의 원금과 올림 미납 이자를 합한 본인 완제 금액이다.
+    function debtOf(address user) public view returns (uint256) {
+        return _debtLedger.quoteRepayment(user, block.timestamp);
+    }
+
+    /// @notice 개인 올림 견적의 합과 구분한 전체 정확 채권의 내림 표시다.
+    function totalDebt() public view returns (uint256) {
+        return _debtLedger.totalDebtRaw(block.timestamp);
+    }
+
+    /// @notice 미저장 전역 이자만 더해 조회하며 저장값과 토큰을 바꾸지 않는다.
+    function _currentAssetsNumerator() private view returns (uint256) {
+        uint256 pending =
+            _debtLedger.totalSnapshot(block.timestamp).interestNumerator - _debtLedger.total.interestNumerator;
+        return _accountedAssetsNumerator + pending;
+    }
+
+    /// @notice 새 전역 이자를 한 번 저장하고 같은 발생분만 공급자 자산에 더한다.
+    function _accrueInterest() private {
+        _accountedAssetsNumerator += _debtLedger.accrueTotal(block.timestamp);
+    }
+
+    /// @notice 수령 도중에는 감소 전 부채를 유지하고 성공 뒤 정산 차이만 추가 수익으로 기록한다.
+    function _receiveRepayment(uint256 amount) private {
+        asset.safeTransferFrom(msg.sender, address(this), amount);
+        (uint256 accrued, InterestMath.Repayment memory payment) =
+            _debtLedger.recordRepayment(msg.sender, amount, block.timestamp);
+        _accountedAssetsNumerator += accrued + payment.roundingSurplusNumerator;
+        emit Repaid(msg.sender, amount);
+    }
+
+    /// @notice 빈 장부의1:1과 한쪽만0인 손상 장부의 기존 오류를 보존한다.
+    function _checkShareAccounting(uint256 assetsNumerator) private view {
+        if ((assetsNumerator == 0) != (totalShares == 0)) {
+            revert ShareMath.InvalidAccountingState(InterestMath.toRawDown(assetsNumerator), totalShares);
+        }
+    }
+
+    /// @notice 정확 자산 비율로 공급은 내림·출금은 올림하며 최초 지분은 raw1:1이다.
+    function _sharesForAssets(uint256 amount, bool roundUp) private view returns (uint256) {
+        _checkShareAccounting(_accountedAssetsNumerator);
+        if (totalShares == 0) return amount;
+        uint256 amountNumerator = InterestMath.toNumerator(amount);
+        return roundUp
+            ? ShareMath.toSharesUp(amountNumerator, _accountedAssetsNumerator, totalShares)
+            : ShareMath.toSharesDown(amountNumerator, _accountedAssetsNumerator, totalShares);
     }
 }

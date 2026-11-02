@@ -4,6 +4,7 @@ pragma solidity 0.8.37;
 import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {LendingPool} from "../src/LendingPool.sol";
+import {InterestMath} from "../src/libraries/InterestMath.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 import {MockWBTC} from "../src/mocks/MockWBTC.sol";
 import {LendingPoolHarness} from "./mocks/LendingPoolHarness.sol";
@@ -237,9 +238,9 @@ contract LendingPoolSharesTest is Test {
         _assertInvalidAccounting(1, 0);
     }
 
-    /// @notice 전송 뒤 회계 합산이 넘치면 토큰 이동·유한 승인까지 모두 복구한다.
+    /// @notice 최대 정수 raw 자산에서1 추가 공급의 분자 합산이 넘치면 토큰·유한 승인도 복구한다.
     function test_SupplyAccountingOverflowRestoresTransferAndAllowance() public {
-        uint256 max = type(uint256).max;
+        uint256 max = type(uint256).max / InterestMath.DENOMINATOR;
         _prepareRatio(new MockUSDC(), max, max, 0);
         deal(address(token), address(pool), 0, true);
         token.mint(ALICE, 1);
@@ -251,12 +252,16 @@ contract LendingPoolSharesTest is Test {
         assertEq(token.totalSupply(), 1);
         assertEq(pool.deposits(ALICE), max);
         uint256[12] memory beforeSupply = _state();
+        uint256 beforeAssetsNumerator = pool.storedAssetsNumerator();
+        bytes memory beforeTotalDebt = abi.encode(pool.storedTotalDebt());
 
         vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", uint256(0x11)));
         vm.prank(ALICE);
         pool.supply(1);
 
         _assertUnchanged(beforeSupply);
+        assertEq(pool.storedAssetsNumerator(), beforeAssetsNumerator);
+        assertEq(abi.encode(pool.storedTotalDebt()), beforeTotalDebt);
     }
 
     /// @notice 비1:1 공급의 실제 전송 뒤 false를 받으면 회계·승인을 복구하고 재시도할 수 있다.

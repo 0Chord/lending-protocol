@@ -12,9 +12,118 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#14](https://github.com/0Chord/lending-protocol/issues/14)의 이자 없는 담보대출·상환 연결과
 [#19](https://github.com/0Chord/lending-protocol/issues/19)의 순수 이자 계산과
 [#23](https://github.com/0Chord/lending-protocol/issues/23)의 고정 금리 상수 분리와
-[#20](https://github.com/0Chord/lending-protocol/issues/20)의 토큰 없는 부채 장부다. 테스트 전용 학습 프로젝트다.
+[#20](https://github.com/0Chord/lending-protocol/issues/20)의 부채 장부와
+[#21](https://github.com/0Chord/lending-protocol/issues/21)의 풀 이자·전액 상환 연결이다. 테스트 전용 학습 프로젝트다.
 
-## 이번에 읽을 동작: 빌린 원금과 이자를 기록한다
+## 이번에 읽을 동작: 이자 권리와 실제 현금을 연결한다
+
+[LendingPool](src/LendingPool.sol)은 연10%·365일 기준으로 **남은 원금에만 초 단위 단리**를 적용한다.
+발생 이자는 전액 공급자의 권리로 인식한다. 상환을 받기 전에는 실제 USDC 잔고가 늘지 않는다.
+읽을 순서는 현재 금액 조회 → 일부/전액 상환 → 공급 지분과 현금 한도 → 실패 복구다.
+
+| 동작 | Bob 원금 | 미납 이자 | Alice 권리 / 풀 자산 | 실제·가용 현금 |
+| --- | ---: | ---: | ---: | ---: |
+| Alice100 공급·Bob40 대출 | 40 | 0 | 100 | 60 |
+| 반년 경과 후 조회 | 40 | 2 | 102 | 60 |
+| Bob12 상환 | 30 | 0 | 102 | 72 |
+| 다시 반년 경과 후 조회 | 30 | 1.5 | 103.5 | 72 |
+| Bob이 `repayAll(32 USDC)` | 0 | 0 | 103.5 | 103.5 |
+
+마지막 상환에서는31.5만 받는다. Bob의 추가 이자 자금3.5는 테스트에서 따로 발행해 준비하며,
+프로토콜이 이자를 지급하기 위해 토큰을 새로 발행하는 기능은 없다.
+[대표 통합 테스트](test/LendingPoolInterest.t.sol)의 처음 세 사례가 위 조회·일부 상환·완제를 각각 확인한다.
+금액 표는 USDC이고 함수에는6자리 최소 단위를 전달한다. `repayAll(32e6)`가32 USDC 상한이다.
+
+### 저장된 장부와 지금 보이는 금액
+
+풀 안의 `_debtLedger`는 개인/전체 원금·이자 분자·기준 시각을 저장한다.
+[DebtLedger](src/accounting/DebtLedger.sol)가 계산한 새 전역 이자를 `_accrueInterest`에서
+`_accountedAssetsNumerator`에 한 번 더한다. 이 자산 기록도 `InterestMath.DENOMINATOR` 배율이다.
+
+아무 거래 없이 시간이 지나도 조회 함수는 미저장 이자를 계산해 보여준다. 조회 자체는 저장하지 않는다.
+`_currentAssetsNumerator`는 현재 전체 이자와 저장 전체 이자의 차이만 자산에 더하므로,
+개인 장부의 갱신이 늦었다고 같은 이자를 다시 수익으로 더하지 않는다.
+
+| 풀 조회 | 반환하는 값 |
+| --- | --- |
+| `debtOf(user)` | 지금 완제하려면 낼 원금+올림 미납 이자 |
+| `totalDebt()` | 전체 정확 원리금 채권을 한 번 내려 표시한 값 |
+| `totalAssets()` | 발생 이자 포함 정확 자산을 내려 표시한 값 |
+| `deposits(user)` | 정확 자산과 지분 비율로 계산한 뒤 최종 USDC에서 내린 권리 |
+| `availableLiquidity()` | 정확 자산−정확 부채로 구한 인정 현금과 실제 현금 중 작은 값 |
+
+개인 견적11+11이라도 정확 부채가10.2+10.7 raw이면 공개 총부채는20 raw다.
+그 개인 견적들을 합쳐 현금을 계산하지 않는다. 직접 송금된 잉여도 권리·상환·재원에 포함하지 않는다.
+
+### 일부 상환과 전액 상환이 다른 지점
+
+`repay(amount)`는 요청액을 그대로 받고 미납 이자부터 갚는다. 견적보다 큰 요청은 전체 거절한다.
+`repayAll(maxAmount)`는 현재 견적이 상한 안인지 먼저 검사하고 **견적만** 받는다.
+상한만큼의 잔고나 승인이 아니라 실제 견적만큼만 있어도 된다. 무제한 승인과 큰 상한도 지원한다.
+
+두 경로는 `_receiveRepayment`에서 합쳐진다. 토큰 수령이 성공한 뒤 `recordRepayment`로 부채를 줄인다.
+이미 자산으로 인식한 이자를 수령했다는 이유로 다시 수익에 더하지 않는다.
+미납 이자를 모두 정리할 때만 올림 차이가 생기며, `roundingSurplusNumerator`만 별도 추가 수익으로 반영한다.
+예를 들어 원금100 raw·이자0.4 raw에30 raw를 갚으면 이자1·원금29를 받아 원금71을 남기고 자산에0.6 raw만 더한다.
+
+조회한42로1초 뒤 `repay(42e6)` 하면 새 소수 이자의 정산 때문에 원금1 raw가 남을 수 있다.
+충분한 상한의 `repayAll`은 실행 시점 부채로 정산하므로 그 시점의 원금·미납을 모두0으로 만든다.
+이후 담보 반환은 별도의 `withdrawCollateral` 호출이다. 가격 오류나 오래된 가격은 상환·반환을 막지 않는다.
+
+### 새 공급자·출금·추가 대출
+
+Alice의100지분 가치가 이자로104가 된 다음 Charlie가104를 공급하면 Charlie도100지분을 받는다.
+Alice의 기존104 권리는 유지되고 이후 발생 이자만 두 사람의 지분에 따라 나뉜다.
+정확 자산을 먼저 정수 USDC로 잘라 지분을 계산하면 이 비율을 틀리게 만들 수 있다.
+공급 지분은 내림, 출금 차감 지분은 올림이며 초기 빈 풀만 raw1:1이다.
+마지막 지분을 없애면서 자산 분자가 조금이라도 남으면 `ResidualAssets`로 거절한다.
+이 오류의 인수는 남은 정확 자산을 USDC raw에서 올린 값이므로 소수 잔여도0으로 보이지 않는다.
+
+권리102·현금60이면61 출금은 `InsufficientLiquidity`이고60까지 지급할 수 있다.
+추가 대출은 현재 원금+미납 이자+새 대출이 담보 한도70% 안에 있어야 한다.
+시간 때문에 한도를 넘은 기존 부채를 자동 청산하지 않는다. 새 대출은 거절하지만 상환과 담보 추가는 가능하다.
+
+### 거절 뒤 무엇이 남는가
+
+- 0요청은 `ZeroAmount`, 부채 없는 전액 상환은 `NoDebt`, 상한 부족은 `RepaymentLimitExceeded(현재 견적, 상한)`이다.
+- 정액 초과 상환은 기존 `RepayExceedsDebt(현재 견적, 요청액)`을 유지한다.
+- 승인·잔고 부족, 전송 후 false/revert, 전파된 재진입 오류는 토큰·승인·지분·담보뿐 아니라 이자 분자·계산 시각도 복구한다.
+- 필요한 정확 분자가 uint256 범위를 넘으면 `Panic(0x11)`이다. 시간 누적이나 정산 올림 차이 때문에 조회·상환까지 실패할 수 있는 극값 한계도 숨기지 않는다.
+
+대출·출금은 기록을 먼저 바꾸고 지급한다. 공급·상환은 수령 뒤 이번 금액을 기록한다.
+상환12의 토큰 콜백에서는 현재 부채42·자산102·현금72·가용60이 보이고, 완료 후 부채30·가용72가 된다.
+일곱 자금 이동 함수는 같은 재진입 잠금을 쓴다. 중첩 오류를 잡으면 바깥 한 번만 성공하고,
+오류가 전파되면 바깥 거래도 복구된다. `Repaid`는 두 상환 경로에서 실제 받은 총액으로 정확히 한 번 발생한다.
+
+<details>
+<summary>#21 테스트를 준비 → 실행 → 실제 검증으로 따라 읽기</summary>
+
+[InterestTestBase](test/helpers/InterestTestBase.sol)는 기존 정상 준비(Alice100 공급·Bob1 WBTC 담보)를 재사용한다.
+[시험용 풀](test/mocks/LendingPoolHarness.sol)만 추가 저장 조회를 노출하며 일반 풀의 외부 API에는 넣지 않는다.
+비정상·소수 극값은 이 하네스로 준비하고, 정상 금액 흐름은 실제 공급·대출·시간 경과·상환으로 만든다.
+
+| 대상 | 준비·실행 | 실제 확인 |
+| --- | --- | --- |
+| [정상·경계 통합](test/LendingPoolInterest.t.sol) 첫 세 사례 | 40 대출·반년·12 상환·반년·상한32 완제 | 부채42→30→31.5→0, 권리/현금 구분, 저장 없는 조회, 실제 수령·유한 승인·이벤트·담보 반환 |
+| 같은 파일의 완제 뒤 재차입 | 완제·담보 반환·반년 대기 후 다시10 대출 | 과거 이자 재청구 없음, 다음 반년의 이자0.5, 무제한 승인 보존 |
+| 같은 파일의 상환 한도·0/부채 없음·큰 상한·지연 사례 | 잘못된 상한/초과 금액, 정확 견적 자금만 준비, 조회 뒤1초 이동 | 정확 오류와 저장 복구, 상한 아닌 견적 수령, 작은 잔액과 후속 완제 |
+| 같은 파일의 추가 대출·이자만 상환·새 공급자 | 반년에10 추가, 이자10 중3 상환, 기존 자산104에 새 공급104 | 과거 이자 보존, 원금100에 다음 이자5, 기존 공급자의 과거 권리 보존 |
+| 같은 파일의 출금·잉여·한도·가격 장애 | 권리102/현금60, 직접 유입20, 소수 이자 뒤 추가 차입, 가격 호출 오류 |61 출금 거절/60 허용, 잉여 제외, 원리금 한도와 담보 제한, 대출 외 동작의 가격 독립 |
+| [정밀도](test/LendingPoolInterestPrecision.t.sol) | raw 자산101.5·지분203에서 독립 공급/출금/조회 |1 raw 공급2지분·출금2지분 차감·2지분 조회1 raw, 조회 저장 없음 |
+| 같은 파일의 다인·정산·반복·극값 | 두 소수 채권,0.4 이자 정산, 동일 시각·다른 개인 순서, 누적/정산 자산 범위 초과 | 개인/전체 정확 장부와 현금 일치, 올림 차이만 수익, 중복 없음, 토큰·승인·저장 복구 |
+| 같은 파일의 마지막 지분·손상 장부 | 소수 잔여 자산·원금0/미납양수 또는 정확 부채가 자산보다 분자1 큼 | 소수도 숨기지 않는 잔여/담보 반환/손상 오류, 빈 풀 재시작1:1 |
+| [전송 실패](test/LendingPoolInterestFailure.t.sol) | 반년 이자 미저장 상태에 부족 승인/잔고 또는 수령·지급 후 false/revert | 실제 오류, 정확 분자·개인/전체 시각·토큰·유한 승인·성공 이벤트 복구와 정상 재시도 |
+| [재진입](test/LendingPoolInterestReentrancy.t.sol) | 실제 수령 뒤 중첩 요청, 오류를 잡거나 전파 | 상환 전 부채 관찰, 공유 잠금 오류, 바깥 한 번 성공 또는 대역 저장까지 복구 |
+| 기존 회귀 파일 | 같은 시각의 기존 대출/상환/지분/담보와 극값 fixture 이행 | 기존 정상·거절·전송 순서 유지. raw 최대 자산 대신 `floor(uint256.max/Q)`에서 추가 공급1의 복구 검사 |
+
+테스트용 발행·임의 가격·시간 이동·상태 주입은 로컬 검증 도구다. 실제 USDC·오라클·네트워크 배포를 검증한 것은 아니다.
+실행 명령은 `forge test --match-path 'test/LendingPoolInterest*.t.sol' -vv`, 필수 회귀는 `forge fmt --check`, `forge build`, `forge test -vv`다.
+로컬에서 신규47개(정상15·정밀11·실패16·재진입5)와 기존274개를 합한321개가 통과했다(실패0·skip0).
+재진입5개 중 두 테스트는 각각7개 중첩 요청을 반복 검증한다. 형식·빌드도 통과했으며 이 결과는 새 PR의 원격 CI 결과와 구분한다.
+
+</details>
+
+## 기반 장부: 빌린 원금과 이자를 기록한다
 
 [DebtLedger](src/accounting/DebtLedger.sol)는 **사람별 원금·미납 이자·마지막 계산 시각을 저장하는 내부 라이브러리**다.
 전체 원금·이자도 별도로 기록한다. 기존 [InterestMath](src/libraries/InterestMath.sol)가 계산을 담당하고,
@@ -38,7 +147,7 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 `borrowerSnapshot`과 `totalSnapshot`은 기록 이후의 이자를 계산해 `Snapshot`으로 반환한다.
 `Snapshot.updatedAt`은 요청한 계산 시각이고, 실제 저장된 `Position.updatedAt`은 조회만으로 바뀌지 않는다.
 **시각0은 정상 시각**이다. 처음 빌리기 전이나 모두 갚은 후의 기간에는 원금0이므로 이자도0이다.
-운영 연결 시 호출자는 일관된 `block.timestamp`를 전달해야 한다. 지금은 하네스가 시험 시각을 전달한다.
+현재 LendingPool은 일관된 `block.timestamp`를 전달한다. 장부 단독 테스트에서는 하네스가 시험 시각을 전달해 저장·조회·과거 시각 거절을 검증한다.
 
 ### 전체 이자를 두 번 더하지 않는 방법
 
@@ -76,12 +185,12 @@ Bob의 저장 기록이 예전 시각에 남아 있어도 **두 사람을 같은
 
 전체 미납 이자에서 뺄 것은 실제로 사라진 **0.4 raw의 분자**다. 올려 받은1 raw 전부를 빼면 다른 사람의
 미납 이자까지 줄이거나 산술 오류가 난다. 그래서 코드는 `개인 정산 전 분자 − 정산 후 분자`를 차감한다.
-올림 차이는 기존 부채에 포함돼 있지 않았으므로 별도로 반환한다. 후속 풀은 새 발생 이자와 이 차이를 각각 한 번 반영한다.
+올림 차이는 기존 부채에 포함돼 있지 않았으므로 별도로 반환한다. 풀은 새 발생 이자와 이 차이를 각각 한 번 반영한다.
 
 두 사람의 정확 부채가10.2 raw·10.7 raw라면 개인 완제 견적은11·11이고, 전체 정확 부채는20.9 raw다.
 `totalDebtRaw`는20을 표시한다. 개인 견적의 합22를 전체 부채로 저장하지 않는다.
 첫 사람이11로 완제하면 전체는10.7, 두 번째도11로 완제하면0이며 올림 차이는 각각0.8·0.3이다.
-최대 지불액을 정하는 `repayAll(maxAmount)`와 실제 토큰 수령은 #21에서 연결한다.
+최대 지불액을 정하는 `repayAll(maxAmount)`와 실제 토큰 수령은 위 #21 풀 흐름에서 연결한다.
 
 ### 거절과 복구
 
@@ -96,8 +205,8 @@ K에 남은 표현 여유 `168_649_639_935`만큼의 미납 분자를 더하면 
 
 [DebtLedgerHarness](test/mocks/DebtLedgerHarness.sol)의 외부 래퍼·상태 조회·`seed` 함수는 테스트용이다.
 운영 라이브러리의 진입점은 모두 `internal`이며 자산 주소·토큰 전송·가격·LTV 검사를 갖지 않는다.
-기존 `LendingPool`은 아직 이 장부를 호출하지 않고 이자 없는 동작을 유지한다.
-이번 실패 복구 검사는 장부와 시각에 대한 것이다. 실제 토큰 실패·재진입 복구는 #21의 통합 검증 대상이다.
+`LendingPool`은 이 장부에 실제 호출의 `block.timestamp`를 전달한다.
+아래 #20 단독 검사는 장부·시각을 다루며, 실제 토큰 실패·재진입은 위 #21 통합 검사에서 확인한다.
 
 <details>
 <summary>정상 장부 테스트의 준비·실행·실제 검증문 따라 읽기</summary>
@@ -150,9 +259,9 @@ fuzz는 제품 조회·반환값 사이의 일관성을 보는 보조 검사다.
 개인 시각이 전체보다 앞선 경우는 정상 API로 만들 수 없으므로 해당 검사만 불일치 fixture를 사용한다.
 임의 분자 끝자리와 최댓값 fixture는 개인 합·전체가 일치하도록 준비한다. 시험용 setter는 실제 운영 API에 없다.
 
-로컬 실행: 장부33개(정상13·경계20), 전체274개·실패0·skip0을 확인했다.
+#20 로컬 구현 당시 실행: 장부33개(정상13·경계20), 당시 전체274개·실패0·skip0을 확인했다.
 `forge test --match-contract 'DebtLedger(Test|BoundsTest)' -vv`, `forge fmt --check`, `forge build`,
-`forge test -vv`를 실행했다. 원격 PR CI는 아직 실행하지 않았다.
+`forge test -vv`를 실행했다.
 
 </details>
 
@@ -171,8 +280,8 @@ fuzz는 제품 조회·반환값 사이의 일관성을 보는 보조 검사다.
 | `DENOMINATOR` (Q) | 315,360,000,000 | `YEAR_SECONDS × RATE_SCALE` |
 
 금리 상수는 `accrue`의 실제 누적식에서 사용한다. 금리를 입력받거나 운영 중 바꾸는 기능은 없다.
-실제 풀은 아직 원금만 빌리고 갚는다. #20의 장부는 이 계산 결과를 저장하며 테스트 하네스에서 사용한다.
-공급자 자산·실제 상환·`repayAll` 연결은 [#21](https://github.com/0Chord/lending-protocol/issues/21)에서 다룬다.
+#20의 장부가 이 계산 결과를 저장하고, #21의 풀이 공급자 자산·실제 상환·`repayAll`에 연결한다.
+계산기 자체는 토큰 전송이나 풀 저장 상태에 의존하지 않는다.
 
 ### 작은 이자를 남겨 두는 방법
 
@@ -200,7 +309,7 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 바로 나누지 않으므로 원금1 raw를3초 유지한 결과와1초씩 세 번 계산한 결과가 모두 분자3,000이다.
 시간 구간을 쪼갰다는 이유로 소수 이자가 사라지지 않는다. 원금과 경과초를 먼저 곱하므로 둘 중0이면
 다른 입력이 최댓값이어도 기존 분자를 보존한다.
-이 함수는 경과초를 입력받는다. 마지막 계산 시각은 위 DebtLedger가 저장하며, 실제 풀 연결 시 호출자는 블록 시각을 전달한다.
+이 함수는 경과초를 입력받는다. 현재 풀은 DebtLedger에 `block.timestamp`를 전달하고, 장부가 저장된 마지막 계산 시각과의 차이를 계산기에 넘긴다.
 이미 정수 금액인 raw를 분자로 바꾸는 `toNumerator`는 `raw × Q`만 계산하며 금리를 다시 곱하지 않는다.
 
 | 함수 | 입력 → 반환 | 경계 |
@@ -229,7 +338,7 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 반환하는 `Repayment`의 `remainingPrincipal`, `interestPaid`, `principalPaid`는 raw이고,
 `remainingInterestNumerator`, `roundingSurplusNumerator`는 정확 분자다.
 표의0.4 raw는 분자`126_144_000_000`, 올림 차이0.6 raw는 분자`189_216_000_000`으로 반환한다.
-이 차이는 장부가 별도로 반환하고 후속 풀에서 공급자 수익으로 반영할 값이다. 계산기 자체는 자산·현금·부채 기록을 바꾸지 않는다.
+이 차이는 장부가 별도로 반환하고 풀에서 공급자 수익으로 반영하는 값이다. 계산기 자체는 자산·현금·부채 기록을 바꾸지 않는다.
 
 정산이 끝난 미납 분자는0이므로 다음 상환에 같은 이자를 다시 청구하지 않는다.
 다만 **새로 생긴 작은 이자를 여러 번 정산하면 올림 비용도 여러 번 생긴다.** 원금4 raw에서 반년 이자0.2 raw를
@@ -252,7 +361,7 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 분자U 자체의 내림K·올림K+1과 순수 상환 배분은 성공할 수 있다. 이를 장부의 모든 정확 채권 합산도
 성공한다는 뜻으로 해석하지 않는다. 기존 [ShareMath](src/libraries/ShareMath.sol)의 큰 중간 곱 처리 계약은 그대로다.
 정상 누적으로 생긴 분자는1,000의 배수지만 변환·견적·상환은 그 밖의 uint256 분자도 받는다.
-기존 운영 장부의 분자를 이전하는 기능은 없으며, DebtLedger와 후속 풀은 처음부터 새 단위를 사용한다.
+기존 운영 장부의 분자를 이전하는 기능은 없으며, DebtLedger와 풀은 처음부터 새 단위를 사용한다.
 
 <details>
 <summary>이자 테스트35개의 준비·실행·실제 검증문 따라 읽기</summary>
@@ -283,7 +392,7 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 | `PartialMaximumInterestPreservesExactRemainder`, `MaximumInterestSettlementAvoidsUnneededMultiplication`, `MaximumPrincipalSettlementDoesNotScalePayment` | 최대 분자 일부/전부, 이자 없는 최대 원금 → 상환 | 나머지168,649,639,935 / 완제 차이146,710,360,065 / 원금 전액 지급; 다섯 필드 비교 |
 
 상환 결과는 공통 `_assertRepayment`가 다섯 필드를 각각 비교한다. 기대값은 계산 함수의 결과를 다시 정답으로 쓰지 않고
-명세의 고정 금액·분자에서 정했다. 이 검증은 순수 계산과 오류 경계이며, 토큰 전송·상태 복구·실제 시각 갱신은 후속 범위다.
+명세의 고정 금액·분자에서 정했다. 이 검증 자체는 순수 계산과 오류 경계를 다룬다. 토큰 전송·상태 복구·실제 시각 갱신은 위의 풀 통합 테스트에서 별도로 확인한다.
 
 새 계산 검사는 `forge test --match-contract InterestMathTest -vv`로 실행한다.
 기존 CI와 같은 전체 검사는 `forge fmt --check`, `forge build`, `forge test -vv`다.
@@ -292,8 +401,9 @@ return interestNumerator + principal * elapsedSeconds * ANNUAL_RATE_BPS;
 
 ## #14에서 익힌 동작: 담보로 빌린 원금을 갚고 담보를 돌려받는다
 
-#14는 **공급 지분·WBTC 담보·USDC 원금 부채를 별도로 기록**한다. 공급자는 `supply`로 지분을 받고,
-차입자는 `depositCollateral`로 담보를 맡긴 뒤 `borrow`로 USDC를 받는다. `repay`는 본인 원금만 줄이며,
+아래는 #14에서 처음 도입한 **공급 지분·WBTC 담보·USDC 원금 부채 분리**의 학습 기록이다. 현재 이자 포함 동작은 위 #21 설명을 따른다. #14 당시에는 원금만 다뤘다.
+공급 지분·담보와 부채는 계속 별도로 기록한다. 공급자는 `supply`로 지분을 받고,
+차입자는 `depositCollateral`로 담보를 맡긴 뒤 `borrow`로 USDC를 받는다. 같은 시각의 이자 없는 사례에서 `repay`는 본인 원금을 줄이며,
 부채가 0이 된 뒤 `withdrawCollateral`을 별도로 호출해야 담보가 돌아온다.
 
 아래는 #13 병합본 `a1fcd9b`에 추가한 대출·상환의 실제 함수와 검증문을 읽기 위한 안내다.
@@ -766,13 +876,17 @@ Alice와 Bob은 테스트용 주소다. 아래 기대값은 모두 이슈에서 
 mapping(address => uint256) public shares;
 
 function deposits(address user) public view returns (uint256) {
-    return ShareMath.toAssetsDown(shares[user], _accountedAssets, totalShares);
+    uint256 assetsNumerator = _currentAssetsNumerator();
+    _checkShareAccounting(assetsNumerator);
+    if (totalShares == 0) return shares[user];
+    // 분자 지분을 먼저 내리고 마지막에 USDC로 내려도 최종 내림값은 같다.
+    return InterestMath.toRawDown(ShareMath.toAssetsDown(shares[user], assetsNumerator, totalShares));
 }
 ```
 
 공급하면 계산한 지분을 더하고, 출금하면 필요한 지분을 줄인다. `deposits`는 저장된 지분을 읽어 USDC로 환산하며 상태를 바꾸지 않는다.
 예를 들어 내 지분3개·전체6개·인정자산10 USDC라면 조회 결과는5 USDC다.
-인정자산은 정상 공급·출금으로 기록한 금액이며, 실제 풀 현금과 구분한다. 직접 송금은 현금만 늘린다.
+인정자산은 정상 공급·출금과 발생 이자·상환 정산 차이를 반영한 금액이며, 실제 풀 현금과 구분한다. 직접 송금은 현금만 늘린다.
 
 먼저 새 풀에서 Alice200 → 공급100 → 출금40을 읽는다. 첫 비율은1:1이고 아래 표는 사람이 읽는 USDC/지분 단위다.
 
@@ -785,7 +899,7 @@ function deposits(address user) public view returns (uint256) {
 
 [첫 출금 테스트](test/LendingPool.t.sol)의 `test_WithdrawMovesTokensAndDebitsOnlyCallerWithoutNewApproval`은 두 시점의 자산·총지분·Alice 지분과 토큰·승인0·총발행량200·Bob 상태0을 직접 비교한다.
 첫 공급 테스트도 같은 기록과 USDC 성공 이벤트1회를 확인한다. `amount`와 이벤트 금액은 계속 USDC다.
-비율이 다른 상황은 [새 연결 테스트](test/LendingPoolShares.t.sol)에서만 준비하며, 현재 풀에 수익·손실을 인정하는 기능은 없다.
+[기존 지분 테스트](test/LendingPoolShares.t.sol)는 하네스로 비1:1 상태를 준비한다. 현재 풀에서는 발생 이자도 지분 가치를 바꾸며, 실제 시간 경과 사례는 [이자 통합 테스트](test/LendingPoolInterest.t.sol)에서 확인한다. 손실 처리 기능은 없다.
 
 아래 공급·출금의 기존 예시는 부채0의 첫1:1 상태다. 그 예시의 예치금은 `deposits`가 계산한 USDC 값이며 별도 금액 원장을 저장하는 뜻이 아니다.
 다른 비율의 반올림·거절·복구는 뒤의 접이식 테스트 안내에서 필요한 사례를 읽는다.
@@ -854,10 +968,11 @@ function decimals() public pure override returns (uint8) {
 ```solidity
 function supply(uint256 amount) external nonReentrant {
     if (amount == 0) revert ZeroAmount();
-    uint256 mintedShares = ShareMath.toSharesDown(amount, _accountedAssets, totalShares);
+    _accrueInterest();
+    uint256 mintedShares = _sharesForAssets(amount, false);
     if (mintedShares == 0) revert ZeroShares();
     asset.safeTransferFrom(msg.sender, address(this), amount);
-    _accountedAssets += amount;
+    _accountedAssetsNumerator += InterestMath.toNumerator(amount);
     totalShares += mintedShares;
     shares[msg.sender] += mintedShares;
     emit Supplied(msg.sender, amount);
@@ -923,7 +1038,7 @@ Alice의 호출에서 `msg.sender`는 Alice이고 `address(this)`는 풀이다.
 ## 출금 기능을 읽는 순서
 
 출금은 요청한 USDC를 본인에게 돌려주면서 그 금액에 필요한 지분을 올림해 차감한다.
-제품 코드는 [LendingPool.withdraw](src/LendingPool.sol#L236), 검증 코드는 [LendingPoolTest](test/LendingPool.t.sol)에 있다.
+제품 코드는 [LendingPool.withdraw](src/LendingPool.sol#L262), 검증 코드는 [LendingPoolTest](test/LendingPool.t.sol)에 있다.
 먼저 부채0인 첫 40 출금과 실패 복구를 읽고, 나머지 경계는 아래 테스트 표로 이어간다.
 현재 출금의 현금 한도는 대출과 같은 `availableLiquidity()`이며, 아래 기존 무부채·무잉여 예시에서는 실제 현금과 같다.
 
@@ -956,15 +1071,18 @@ Alice의 호출에서 `msg.sender`는 Alice이고 `address(this)`는 풀이다.
 ```solidity
 function withdraw(uint256 amount) external nonReentrant {
     if (amount == 0) revert ZeroAmount();
+    _accrueInterest();
     uint256 deposited = deposits(msg.sender);
     if (amount > deposited) revert InsufficientDeposit(deposited, amount);
     uint256 available = availableLiquidity();
     if (amount > available) revert InsufficientLiquidity(available, amount);
 
-    uint256 burnedShares = ShareMath.toSharesUp(amount, _accountedAssets, totalShares);
-    uint256 remainingAssets = _accountedAssets - amount;
-    if (burnedShares == totalShares && remainingAssets != 0) revert ResidualAssets(remainingAssets);
-    _accountedAssets = remainingAssets;
+    uint256 burnedShares = _sharesForAssets(amount, true);
+    uint256 remainingAssets = _accountedAssetsNumerator - InterestMath.toNumerator(amount);
+    if (burnedShares == totalShares && remainingAssets != 0) {
+        revert ResidualAssets(InterestMath.toRawUp(remainingAssets));
+    }
+    _accountedAssetsNumerator = remainingAssets;
     totalShares -= burnedShares;
     shares[msg.sender] -= burnedShares;
     asset.safeTransfer(msg.sender, amount);
@@ -1060,7 +1178,7 @@ LendingPool은 [#8](https://github.com/0Chord/lending-protocol/issues/8)에서 �
 
 A는 풀에서 인정한 USDC 자산, S는 총지분이다. 모든 인수·반환값은 정수 최소 단위다.
 USDC·지분을 소수점 6자리로 표현하면 자산 10 USDC·총지분 6개는 A=10_000_000, S=6_000_000이다.
-이 비율은 계산 테스트의 가정이며 현재 풀에 수익을 만드는 기능이 있다는 뜻은 아니다.
+이 비율은 ShareMath 단독 계산 테스트의 가정이다. 현재 풀에서는 별도로 발생 이자를 공급자 자산에 반영하며 위의 #21 통합 테스트로 검증한다.
 
 | 읽을 흐름 | 계산·코드 | 확인할 결과 |
 | --- | --- | --- |
@@ -1128,7 +1246,7 @@ assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
 
 공급·출금은 기존 USDC 입력을 유지하고 `shares`로 권리를 기록한다. 전송 실패가 전파되면 자산·총지분·개인 지분과 토큰 상태가 함께 복구된다.
 정수 반올림 때문에 지분 합은 총지분과 같아도, 내림한 USDC 권리의 합은 인정자산보다 작을 수 있다.
-첫1:1 상태에서 정상 공급·출금만 하면1:1이 유지된다. 아래의 다른 비율은 시험용 준비이며 실제 수익·손실 인정 API는 없다.
+대출·이자가 없는 첫1:1 상태에서 정상 공급·출금만 하면1:1이 유지된다. 아래 비1:1 사례는 시험용 상태 준비이며, 현재 풀의 실제 이자 발생·정산 흐름은 맨 위의 #21 안내에서 다룬다.
 
 <details>
 <summary>직접 송금·반올림·거절·실패 복구 테스트의 입력과 실제 확인</summary>
@@ -1139,7 +1257,7 @@ assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
 비1:1의 `_prepareRatio`는 총발행량0인 새 토큰에서 정상 공급으로 지분을 만든다. 직접 mint가 인정자산을 바꾸지 않았는지 먼저 검사한 다음,
 [시험용 풀](test/mocks/LendingPoolHarness.sol)의 `setAccountedAssetsForTest`로만 가정 비율을 준비한다. setter는 일반 LendingPool에 없다.
 재진입 모형 역시 로컬 EVM의 실제 토큰 이동 후 콜백이며 외부 네트워크·실제 USDC 연동 검증은 아니다.
-표의 언더스코어 없는 작은 수와 M도 모두 정수 최소 단위다. M은 uint256 최댓값이다.
+표의 언더스코어 없는 작은 수와 K도 모두 정수 최소 단위다. K는 `floor(uint256.max / InterestMath.DENOMINATOR)`이며 정확 자산 분자로 변환 가능한 최대 정수 raw 금액이다.
 
 | 테스트 | 준비·실행 | 실제 확인 |
 | --- | --- | --- |
@@ -1161,7 +1279,7 @@ assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
 | `test_ZeroSharesTakesPriorityOverTokenFailure` | 지분0 공급과 실제 전송 뒤 revert 모형이 겹침 | 토큰 오류 대신 ZeroShares,12값 유지 |
 | `test_MissingAssetsRejectsPositiveCallsAndAllClaimQueries` | A0/S1·Alice q1/Bob q0 | 양수 공급/출금·두 권리 조회는 정확한 장부 오류,0 요청은 ZeroAmount 우선·원시10값 유지 |
 | `test_MissingSharesRejectsPositiveCallsAndAllClaimQueries` | A1/S0·두 q0 | 같은 오류 우선순위와 원시 상태 보존 |
-| `test_SupplyAccountingOverflowRestoresTransferAndAllowance` | 정상 M 공급 뒤 현금/총량0으로 조정→Alice mint1·유한 승인1→공급1 | 정확한 Panic(0x11), A/S/q/권리M·현금0·Alice1·승인1·총량1 복구 |
+| `test_SupplyAccountingOverflowRestoresTransferAndAllowance` | 정상 K 공급 뒤 현금/총량0으로 조정→Alice mint1·유한 승인1→공급1 | 정확한 Panic(0x11), A/S/q/권리K·현금0·Alice1·승인1·총량1과 정확 자산·전체 부채 저장값 복구 |
 | `test_NonUnitFalseSupplyRestoresStateAndAllowsRetry` | 비1:1 공급 전송 후 false→장애 해제·같은 공급 재시도 | 첫 시도 정확한 토큰 오류·12값 복구, 재시도 Bob q2_400_000·승인0 |
 | `test_NonUnitFalseWithdrawalRestoresStateAndAllowsRetry` | 비1:1 선차감·전송 후 false→장애 해제·같은 출금 | 복구 후 재시도 A6_000_000/S/q3_600_000·지급4_000_000 |
 | `test_NonUnitCaughtReentryLeavesOneOuterWithdrawal` | A10/S6/qAlice5/qToken1에서 외부 출금2 중 중첩 출금1 | 중첩만 잠금 오류, A8/S4/qAlice3/qToken1·권리Alice6·실제 지급2·이벤트1회 |
@@ -1178,8 +1296,8 @@ assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
 
 MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이다.
 토큰 발행에는 실제 자산 입금이 없으며, 풀의 예치 권리를 만들지 않는다.
-풀은 대출 자산 MockUSDC6·담보 MockWBTC8·Mock 가격 원천8을 배포 때 고정한다. 본인 공급·출금·담보 입금/반환·원금 대출/상환을 다룬다.
-자산 변경·대리 공급/차입/상환·수령자 지정·풀의 이자 누적·청산·잉여 회수·구제 함수는 없다. #19의 순수 이자 계산은 아직 풀에 연결하지 않았다. 가격 하락만으로 부채를 삭제하거나 손실을 보전하지 않는다.
+풀은 대출 자산 MockUSDC6·담보 MockWBTC8·Mock 가격 원천8을 배포 때 고정한다. 본인 공급·출금·담보 입금/반환·단리 대출/상환·상한 전액 상환을 다룬다.
+자산 변경·대리 공급/차입/상환·수령자 지정·변동 금리·복리·수수료·청산·잉여 회수·구제 함수는 없다. 가격 하락만으로 부채를 삭제하거나 손실을 보전하지 않는다.
 실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다. 배포는 이번 작업 범위에 포함하지 않는다.
 
 풀에 직접 전송·발행한 토큰은 예치 권리를 만들지 않는다. 직접 전송 10 후 정상 공급 100이면 풀 현금은 110이고 예치 권리는 100이다.
@@ -1187,7 +1305,7 @@ MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이�
 생성자의 코드 존재·6/8/8 metadata 검사는 모든 ERC20의 안전성이나 가격의 진실성을 보장하지 않는다.
 재진입 검증도 임의의 악성 자산 지원을 의미하지 않는다. 실제 외부 서비스·시장가격의 정확성은 이번 로컬 Mock 범위 밖이다.
 
-테스트는 단위 연결·공급 권리·담보·원금 부채·공통 재원의 정상·거절·전송 실패와 대표 재진입 경로를 다룬다.
+테스트는 단위 연결·공급 권리·담보·원리금 부채·공통 재원의 정상·거절·전송 실패와 대표 재진입 경로를 다룬다.
 #19에서는 이와 별도로 단리 누적·완제 견적·이자 우선 배분·정산 올림·산술 범위를 검증한다.
 작성된 사례·실제 실행 결과·독립 검토 완료는 구분하며, 로컬 검사 통과를 사용자 이해나 독립 리뷰 완료로 읽지 않는다.
 OpenZeppelin의 모든 ERC20 동작이나 실제 USDC 연동을 검증하는 범위는 아니다.

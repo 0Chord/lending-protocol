@@ -29,13 +29,18 @@ abstract contract BorrowTestBase is Test {
         usdc = token;
         wbtc = new MockWBTC();
         price = new MockCollateralPriceSource(100e8, 10_000);
-        pool = new LendingPool(usdc, wbtc, price);
+        pool = _newPool();
         usdc.mint(ALICE, 100e6);
         vm.startPrank(ALICE);
         usdc.approve(address(pool), 100e6);
         pool.supply(100e6);
         vm.stopPrank();
         _depositFor(BOB, 1e8);
+    }
+
+    /// @notice 이자 시험은 같은 정상 준비를 사용하며 저장값 관측 하네스만 바꿔 배포한다.
+    function _newPool() internal virtual returns (LendingPool) {
+        return new LendingPool(usdc, wbtc, price);
     }
 
     /// @notice 시험 토큰을 발행하고 지정 사용자가 정상 담보 입금을 한다.

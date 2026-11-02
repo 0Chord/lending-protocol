@@ -3,6 +3,7 @@ pragma solidity 0.8.37;
 
 import {BorrowTestBase} from "./helpers/BorrowTestBase.sol";
 import {LendingPool} from "../src/LendingPool.sol";
+import {DebtLedger} from "../src/accounting/DebtLedger.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICollateralPriceSource} from "../src/interfaces/ICollateralPriceSource.sol";
@@ -14,10 +15,10 @@ contract InvalidDebtAccountingHarness is LendingPool {
         LendingPool(asset_, collateral_, price_)
     {}
 
-    /// @notice 시험에서만 사용자의 부채와 총부채를 같은 손상 값으로 맞춘다.
+    /// @notice 개인·전체를 같은 시각의 원금으로 맞춰 정확 채권이 자산보다 큰 상태만 만든다.
     function setDebtForTest(address user, uint256 amount) external {
-        debtOf[user] = amount;
-        totalDebt = amount;
+        _debtLedger.borrowers[user] = DebtLedger.Position(amount, 0, block.timestamp);
+        _debtLedger.total = DebtLedger.Position(amount, 0, block.timestamp);
     }
 }
 
