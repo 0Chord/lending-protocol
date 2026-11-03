@@ -33,6 +33,17 @@ library CollateralMath {
         pure
         returns (uint256)
     {
+        uint256 price = validatePrice(price8, updatedAt, currentTime);
+        return Math.mulDiv(collateralWBTC8, price, VALUE_SCALE, Math.Rounding.Floor);
+    }
+
+    /// @notice 담보 가치의 정수 내림 없이 같은 가격·갱신시각 규칙만 검증한다.
+    /// @dev 수량이나 부채가 0이어도 호출자가 가격 검증을 생략하지 않도록 재사용한다.
+    /// @param price8 소수점 8자리 WBTC의 USDC 직접호가
+    /// @param updatedAt 가격 원천이 기록한 갱신시각
+    /// @param currentTime 검증 기준이 되는 현재 시각
+    /// @return 양수 검증을 통과해 부호 없이 사용할 가격
+    function validatePrice(int256 price8, uint256 updatedAt, uint256 currentTime) internal pure returns (uint256) {
         if (price8 <= 0) revert InvalidPrice(price8);
         if (updatedAt == 0 || updatedAt > currentTime) {
             revert InvalidPriceTimestamp(updatedAt, currentTime);
@@ -41,7 +52,7 @@ library CollateralMath {
 
         // 양수 검사를 통과한 int256 값은 uint256 범위 안에 있다.
         // forge-lint: disable-next-line(unsafe-typecast)
-        return Math.mulDiv(collateralWBTC8, uint256(price8), VALUE_SCALE, Math.Rounding.Floor);
+        return uint256(price8);
     }
 
     /// @notice 내림한 담보 가치의 70%를 다시 내려 USDC 대출 한도로 계산한다.
