@@ -215,7 +215,8 @@ contract LendingPool is ReentrancyGuard {
         _accrueInterest();
         uint256 debt = debtOf(msg.sender);
         if (amount > debt) revert RepayExceedsDebt(debt, amount);
-        _receiveRepayment(amount);
+        _receiveRepayment(msg.sender, msg.sender, amount);
+        emit Repaid(msg.sender, amount);
     }
 
     /// @notice 실행 시 완제 금액이 상한 이하이면 그 금액만 받아 부채를 모두 정리한다.
@@ -227,7 +228,8 @@ contract LendingPool is ReentrancyGuard {
         if (debt == 0) revert NoDebt();
         if (debt > maxAmount) revert RepaymentLimitExceeded(debt, maxAmount);
         _accrueInterest();
-        _receiveRepayment(debt);
+        _receiveRepayment(msg.sender, msg.sender, debt);
+        emit Repaid(msg.sender, debt);
     }
 
     /// @notice 본인 지분의 USDC 가치를 최소 단위에서 내려 반환한다.
@@ -297,17 +299,20 @@ contract LendingPool is ReentrancyGuard {
     }
 
     /// @notice 새 전역 이자를 한 번 저장하고 같은 발생분만 공급자 자산에 더한다.
-    function _accrueInterest() private {
+    function _accrueInterest() internal {
         _accountedAssetsNumerator += _debtLedger.accrueTotal(block.timestamp);
     }
 
-    /// @notice 수령 도중에는 감소 전 부채를 유지하고 성공 뒤 정산 차이만 추가 수익으로 기록한다.
-    function _receiveRepayment(uint256 amount) private {
-        asset.safeTransferFrom(msg.sender, address(this), amount);
+    /// @notice 지급자의 USDC를 받은 뒤 지정 차입자의 부채만 정산한다.
+    /// @dev 호출자는 공통 잠금·금액 검사·수령 전 전역 이자 갱신을 맡고 성공 이벤트를 기록한다.
+    /// @param payer 실제 토큰과 승인을 사용할 지급자
+    /// @param borrower 원금과 미납 이자를 줄일 차입자
+    /// @param amount 실제 받을 USDC 최소 단위 금액
+    function _receiveRepayment(address payer, address borrower, uint256 amount) internal {
+        asset.safeTransferFrom(payer, address(this), amount);
         (uint256 accrued, InterestMath.Repayment memory payment) =
-            _debtLedger.recordRepayment(msg.sender, amount, block.timestamp);
+            _debtLedger.recordRepayment(borrower, amount, block.timestamp);
         _accountedAssetsNumerator += accrued + payment.roundingSurplusNumerator;
-        emit Repaid(msg.sender, amount);
     }
 
     /// @notice 빈 장부의1:1과 한쪽만0인 손상 장부의 기존 오류를 보존한다.
