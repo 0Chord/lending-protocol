@@ -14,11 +14,117 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#23](https://github.com/0Chord/lending-protocol/issues/23)의 고정 금리 상수 분리와
 [#20](https://github.com/0Chord/lending-protocol/issues/20)의 부채 장부와
 [#21](https://github.com/0Chord/lending-protocol/issues/21)의 풀 이자·전액 상환 연결과
-[#27](https://github.com/0Chord/lending-protocol/issues/27)의 순수 청산 계산이다. 테스트 전용 학습 프로젝트다.
+[#27](https://github.com/0Chord/lending-protocol/issues/27)의 순수 청산 계산과
+[#28](https://github.com/0Chord/lending-protocol/issues/28)의 내부 상환자·부채 주체 분리다. 테스트 전용 학습 프로젝트다.
 
-## 이번에 읽을 동작: 청산 대상과 받을 WBTC를 계산한다
+## 이번에 읽을 동작: 돈을 내는 사람과 부채가 줄어드는 사람을 나눈다
 
-이번 [LiquidationMath](src/libraries/LiquidationMath.sol)는 두 질문을 계산한다.
+청산에서는 Charlie가 USDC를 내고 Bob의 부채가 줄어야 한다.
+이번 [LendingPool](src/LendingPool.sol)은 내부 수령 함수가 **지급자(payer)**와 **차입자(borrower)**를 따로 받도록 바꾼다.
+기존 공개 `repay`·`repayAll`은 두 주소에 모두 `msg.sender`를 전달하므로 본인 돈으로 본인 부채를 갚는 동작을 유지한다.
+
+| 호출 경로 | USDC를 낼 주소 | 부채를 줄일 주소 | 풀 성공 이벤트 |
+| --- | --- | --- | --- |
+| 기존 `repay(amount)` | 호출자 | 호출자 | `Repaid`1회, 실제 요청액 |
+| 기존 `repayAll(maxAmount)` | 호출자 | 호출자 | `Repaid`1회, 상한 안의 실제 완제액 |
+| 테스트용 `repayForTest(borrower,amount)` | 호출자 | 지정 차입자 | 없음 |
+
+세 번째 경로는 [시험용 하네스](test/mocks/LendingPoolHarness.sol)에만 있다. 일반 풀의 공개 API에는 대리 상환 함수를 추가하지 않는다.
+실제 청산 함수에서 이 내부 수령 경로를 사용하는 작업은 [#29](https://github.com/0Chord/lending-protocol/issues/29)다.
+
+### 첫12 USDC는 누구 지갑에서 나가고 누구 부채를 갚나
+
+Alice100 공급 → Bob1 WBTC 입금·40 차입 → 반년 경과로 현재 부채42를 준비한다.
+Charlie에게12를 발행해 유한 승인12를 주고, Charlie가 하네스의 `repayForTest(Bob,12e6)`를 호출한다.
+발행·승인은 테스트 준비이고, 검사 대상은 그 뒤 실제 USDC 수령과 Bob의 정산이다.
+
+| 관측값(USDC 표시 단위) | 호출 직전 | 성공 직후 |
+| --- | ---: | ---: |
+| Charlie 지갑 / 승인 | 12 / 12 | 0 / 0 |
+| Bob 지갑 / 승인 | 40 / 0 | 40 / 0 |
+| Bob 원금 / 미납 이자 | 40 / 2 | 30 / 0 |
+| 풀 실제 현금 / 가용 현금 | 60 / 60 | 72 / 72 |
+| 풀 자산 / Alice 권리 | 102 / 102 | 102 / 102 |
+
+Bob의 WBTC 담보1과 Alice의 지분100은 그대로다. Bob 지갑의 토큰이나 승인을 사용해서는 이 테스트를 통과할 수 없다.
+[첫 테스트](test/LendingPoolRepaymentActors.t.sol)는 이 값과 총발행량112, 정확 저장 장부·시각, 하네스의 `Repaid`0회를 확인한다.
+
+### 수령과 정산을 이어주는 코드
+
+내부 `_receiveRepayment(payer,borrower,amount)`의 핵심은 다음과 같다.
+
+```solidity
+asset.safeTransferFrom(payer, address(this), amount);
+(uint256 accrued, InterestMath.Repayment memory payment) =
+    _debtLedger.recordRepayment(borrower, amount, block.timestamp);
+_accountedAssetsNumerator += accrued + payment.roundingSurplusNumerator;
+```
+
+첫 줄은 지급자의 토큰·승인을 사용하고, 두 번째 호출은 지정 차입자의 미납 이자부터 원금 순으로 줄인다.
+이자는 이미 공급자 자산에 반영돼 있으므로 받은12 전체를 다시 수익으로 더하지 않는다.
+아직 저장하지 않은 새 전역 이자와 소수 정산의 올림 차이만 각각 한 번 반영한다.
+다른 차입자의 저장 원금·미납 분자·갱신시각을 건드리지 않는다.
+
+공통 함수는 성공 이벤트를 직접 내보내지 않는다. 본인 상환의 두 공개 함수가 정산 성공 뒤 `Repaid`를 각각1회 기록한다.
+후속 청산이 지급자·차입자를 함께 기록할 수 있도록 역할을 분리한 것이다.
+내부 함수의 호출자는 공통 잠금·금액 검사·수령 전 전역 이자 갱신을 책임진다.
+이미 잠긴 공개 함수가 호출하므로 내부 함수에 다시 `nonReentrant`를 붙이지 않는다.
+
+### 실패하거나 콜백이 끼면 어떤 값이 보이나
+
+`repay`의 순서는0 검사 → 전역 이자 저장 → 본인 견적/초과 검사 → 수령/정산이다.
+`repayAll`은 상한0 → 본인 견적/무부채/상한 검사 → 전역 이자 저장 → 수령/정산이다.
+하네스는 `repay`의 검사 순서에 지정 차입자를 적용한다. 상환은 가격이나 배포 때의 metadata를 다시 읽지 않는다.
+
+USDC가12 이동한 직후 콜백에서는 **Bob 부채42·전체42·자산102·실제 현금72·가용60**이 보인다.
+토큰은 들어왔지만 부채를 줄이기 전이라 새 현금을 아직 풀지 않는다. 정산이 끝난 뒤 Bob 부채30·가용72가 된다.
+콜백이 관측할 사용자는 Bob이고, 중첩 호출의 실행자는 토큰 계약 주소다.
+
+승인/잔고 부족은 Charlie 기준 오류여야 한다. 실제 이동 뒤 false/revert, 수령 뒤 정산 범위 초과, 전파된 재진입 오류는
+Charlie 토큰·유한 승인뿐 아니라 개인/전체 원금·정확 이자·시각·자산·콜백 기록까지 해당 호출 전으로 되돌린다.
+앞선 별도 승인·담보 입금을 취소한다는 뜻은 아니다. 수령 전 누적 실패와 수령 후 정산 실패는 따로 검증한다.
+중첩 오류를 잡으면 바깥 상환만 한 번 성공하고, 오류를 전파하면 바깥도 복구된다.
+
+### 다른 부채와 직접 송금된20은 어떻게 남나
+
+Alice100 공급, Bob40·Charlie20 차입, 외부 직접 송금20, 반년 경과 뒤 Charlie가 Bob에게12를 갚는 예시다.
+직전 전체 부채63·자산103·실제 현금60·가용40에서 완료 뒤 전체 부채51·자산103·실제 현금72·가용52가 된다.
+Bob은30, Charlie의 현재 부채21은 그대로이고 Charlie의 지갑만20→8이다.
+Charlie의 저장 원금20·미납 분자0·옛 기준 시각도 유지한다. 현재 이자1은 조회에서 계산해 보여준다.
+직접 송금된20은 계속 실제 현금−가용 현금 차이로 남으며, 공급자 권리를 늘리거나 Bob 상환으로 사라지지 않는다.
+
+<details>
+<summary>#28 테스트를 준비 → 실행 → 실제 검증으로 따라 읽기</summary>
+
+기본 준비는 기존 `InterestTestBase`의 정상 공급100·Bob 담보1이다. 정상 금액은 실제 차입·시간 이동·토큰 발행/승인으로 만들고,
+최대 정산 실패만 기존 정밀도 하네스로 일관된 장부를 준비한다. 기대값은 명세의 고정 수치다.
+
+| 테스트 묶음 | 준비·실행 | 실제 확인 |
+| --- | --- | --- |
+| [정상·회귀11개](test/LendingPoolRepaymentActors.t.sol) | 첫 Charlie12 지불, 기존 본인 정액/상한 완제, 자기 부채가 있는 지급자, 가격/metadata 장애, 소수 이자·동일시각 반복·무한 승인·본인 하네스 상환 | 실제 지급자의 잔고·승인만 사용, 지정 부채/전체 장부·저장 시각, 타인 권리·기부 현금 보존, 본인 이벤트1회/하네스 풀 이벤트0회 |
+| [토큰 실패·거절6개](test/LendingPoolRepaymentActorsFailure.t.sol) | Charlie 승인11/잔고11로12 요청, 이동 뒤 false/revert, 부채42에43 요청·무부채 양수 요청 | 지급자 기준 정확 오류와 토큰·유한 승인·자산·개인/전체 장부 복구, 자원/장애를 고친 재시도에서12만 반영 |
+| 같은 파일의 정밀도/오류순서5개 | 최대 자산 직전의 일관된 장부를 준비해1초/2초 이동, 금액0·초과·무부채·상한 충돌 | Charlie transferFrom 도달 후 정산 실패와 수령 전 누적 실패 구분, 기존 공개 상환의 오류 우선순위, 원시 저장값 복구 |
+| [콜백·잠금3개](test/LendingPoolRepaymentActorsReentrancy.t.sol) | Bob 관측1건과 정상 성공 가능한 기존7개 양수 중첩 요청의 잡음/전파 반복 | 감소 전 부채·현금/가용 구분, 정확 잠금 오류, 중첩 호출자 자원 보존, 전파 시 콜백 상태까지 복구·재시도 |
+
+소수 예시는 원금50 raw·반년 이자2.5 raw에서1을 갚으면 원금50·미납1.5 raw가 남는다.
+원금8 raw·반년 이자0.4 raw에서3을 갚으면 이자1·원금2를 받아 원금6이 남고, 올림 차이0.6 raw만 추가 수익이다.
+같은 시각에 남은6을 갚아도 올림 차이나 지난 이자를 다시 더하지 않는다.
+
+수령 후 정산 실패는 `A=M−1000`, `M=uint256.max`인 기존 일관된 분자 fixture를 사용한다.
+1초 뒤에는 정상 수령2 raw 뒤 정산 차이 가산에서 `Panic(0x11)`이 나며,2초 뒤에는 누적 자체가 먼저 실패한다.
+후자의 전송에 별도 오류를 설정해 토큰 호출이 먼저 실행되지 않았음을 구별한다. 공개 자산 조회도 실패할 수 있어 원시 저장값으로 복구를 비교한다.
+
+추가25개는 테스트 함수 수다. 잡음/전파 두 함수는 각각7개 요청을 정상 성공 대조와 함께 반복하므로 단순 함수 수와 실행 상황 수를 구분한다.
+테스트용 진입점은 제품의8번째 자금 이동 API가 아니며, 모든 함수 조합의 재진입을 전수 검사했다고 주장하지 않는다.
+
+</details>
+
+#28 로컬 검증은 기존352개와 추가25개를 합한377개다. 형식·빌드·전체 테스트가 통과했고 실패0·skip0이다.
+일반 `LendingPool`의 공개 ABI는 변경 전과 같다. 새 PR/main CI와 게시 전 사용자 주요 흐름·설명 자료 확인은 이후 단계에서 별도로 확인한다.
+
+## 기반 계산기: 청산 대상과 받을 WBTC를 계산한다
+
+[LiquidationMath](src/libraries/LiquidationMath.sol)는 두 질문을 계산한다.
 **“현재 대출은 청산 대상인가?”**, **“전액을 갚으면 WBTC를 얼마나 받을까?”**다.
 실제 청산자의 USDC 수령·부채 정리·WBTC 전송을 풀에 연결하는 작업은 [#29](https://github.com/0Chord/lending-protocol/issues/29)에서 진행한다.
 
@@ -101,7 +207,7 @@ USDC 최소 단위1을 갚고 가격이100 USDC라면 보상 포함 필요량은
 
 </details>
 
-로컬 형식·빌드·전체352개 테스트가 통과했다(기존321개+신규31개, 실패0·skip0).
+#27 구현 당시 로컬 형식·빌드·전체352개 테스트가 통과했다(기존321개+신규31개, 실패0·skip0).
 이는 로컬 실행 결과이며 새 PR/main CI와 게시 전 사용자 이해 확인은 이후 단계에서 별도로 확인한다.
 
 ## 기존 풀 동작: 이자 권리와 실제 현금을 연결한다
@@ -151,6 +257,7 @@ USDC 최소 단위1을 갚고 가격이100 USDC라면 보상 포함 필요량은
 상한만큼의 잔고나 승인이 아니라 실제 견적만큼만 있어도 된다. 무제한 승인과 큰 상한도 지원한다.
 
 두 경로는 `_receiveRepayment`에서 합쳐진다. 토큰 수령이 성공한 뒤 `recordRepayment`로 부채를 줄인다.
+현재는 두 경로가 지급자와 차입자를 모두 본인으로 전달하고, 정산 뒤 각 공개 함수에서 `Repaid`를 기록한다.
 이미 자산으로 인식한 이자를 수령했다는 이유로 다시 수익에 더하지 않는다.
 미납 이자를 모두 정리할 때만 올림 차이가 생기며, `roundingSurplusNumerator`만 별도 추가 수익으로 반영한다.
 예를 들어 원금100 raw·이자0.4 raw에30 raw를 갚으면 이자1·원금29를 받아 원금71을 남기고 자산에0.6 raw만 더한다.
@@ -679,6 +786,7 @@ forge test --match-contract LendingPoolCollateralReentrancyTest -vv
 forge test --match-contract LendingPoolConfigurationTest -vv
 forge test --match-contract LendingPoolBorrowTest -vv
 forge test --match-contract LendingPoolRepayTest -vv
+forge test --match-contract 'LendingPoolRepaymentActors.*Test' -vv
 forge test --match-contract LendingPoolLiquidityTest -vv
 forge test --match-contract LendingPoolDebtFailureTest -vv
 forge test --match-contract LendingPoolBorrowReentrancyTest -vv

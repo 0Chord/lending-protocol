@@ -7,14 +7,24 @@ import {DebtLedger} from "../../src/accounting/DebtLedger.sol";
 import {ICollateralPriceSource} from "../../src/interfaces/ICollateralPriceSource.sol";
 import {InterestMath} from "../../src/libraries/InterestMath.sol";
 
-/// @title 비율·잘못된 장부 준비 전용 풀
-/// @notice 실제 공급으로 지분을 만들고 시험에서만 정확 자산·부채를 주입하거나 저장값을 관측한다.
-/// @dev 일반 풀에는 이 setter가 없으며 개인·전체 장부의 일관성과 토큰 현금은 시험에서 준비한다.
+/// @title 회계 경계와 내부 상환 경로를 검증하는 시험용 풀
+/// @notice 실제 자금으로 상환하고 시험에서만 정확 장부를 주입하거나 저장값을 관측한다.
+/// @dev 일반 풀에는 이 setter와 대리 상환 진입점이 없으며 장부·현금의 일관성은 시험에서 준비한다.
 contract LendingPoolHarness is LendingPool {
     /// @notice 자산·담보·가격 원천을 일반 풀과 같은 생성자 검사에 그대로 전달한다.
     constructor(IERC20 asset_, IERC20 collateralAsset_, ICollateralPriceSource priceSource_)
         LendingPool(asset_, collateralAsset_, priceSource_)
     {}
+
+    /// @notice 시험에서 호출자의 USDC로 지정 차입자의 부채를 갚는다.
+    /// @dev 제품에는 없는 진입점이며 잠금·정액 상환 순서를 유지하고 풀 성공 이벤트는 내보내지 않는다.
+    function repayForTest(address borrower, uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        _accrueInterest();
+        uint256 debt = debtOf(borrower);
+        if (amount > debt) revert RepayExceedsDebt(debt, amount);
+        _receiveRepayment(msg.sender, borrower, amount);
+    }
 
     /// @notice 기존 raw 자산 준비값을 정확 분자로 바꾸며 표현 범위를 넘으면 거절한다.
     function setAccountedAssetsForTest(uint256 assets) external {
