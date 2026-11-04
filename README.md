@@ -15,9 +15,166 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 [#20](https://github.com/0Chord/lending-protocol/issues/20)의 부채 장부와
 [#21](https://github.com/0Chord/lending-protocol/issues/21)의 풀 이자·전액 상환 연결과
 [#27](https://github.com/0Chord/lending-protocol/issues/27)의 순수 청산 계산과
-[#28](https://github.com/0Chord/lending-protocol/issues/28)의 내부 상환자·부채 주체 분리다. 테스트 전용 학습 프로젝트다.
+[#28](https://github.com/0Chord/lending-protocol/issues/28)의 내부 상환자·부채 주체 분리와
+[#29](https://github.com/0Chord/lending-protocol/issues/29)의 전액 청산 연결이다. 테스트 전용 학습 프로젝트다.
 
-## 이번에 읽을 동작: 돈을 내는 사람과 부채가 줄어드는 사람을 나눈다
+## 이번에 읽을 동작: 위험한 부채를 갚고 풀에 보관한 담보를 받는다
+
+Bob의 담보는 이미 풀에 맡겨져 있다. 청산은 Bob 지갑에서 돈을 가져오는 동작이 아니다.
+Charlie가 자기 USDC로 Bob의 현재 원리금을 모두 갚고, 풀에 보관된 Bob의 WBTC 중 계산한 양을 받는다.
+입력은 `liquidate(Bob, 최대 낼 USDC, 최소 받을 WBTC)`이며, Bob 본인도 같은 조건으로 호출할 수 있다.
+
+전체 순서는 **현재 부채와 가격으로 조건 검사 → Charlie의 USDC 수령 → Bob 부채 정산 → 기록 담보 차감·WBTC 지급 → 청산 이벤트**다.
+먼저 아래 정상1건을 읽고, 거절·소수 금액·전송 실패·두 토큰의 중첩 호출로 내려가면 된다.
+
+### 73.5 USDC를 내면 누가 무엇을 받나
+
+Alice가100 USDC를 공급하고 Bob은1 WBTC를 맡겨70 USDC를 빌린다. 반년이 지나 원리금73.5가 됐고 가격은80이다.
+Charlie는74 USDC를 갖고74만큼 승인한 뒤 `liquidate(Bob, 74e6, 96_000_000)`을 호출한다.
+상한74 전부를 받지 않고 실행 시 필요한73.5만 받는다.
+
+| 관측값 | 호출 직전 | 성공 직후 |
+| --- | ---: | ---: |
+| Charlie USDC / 잔여 승인 | 74 / 74 | 0.5 / 0.5 |
+| Charlie WBTC | 0 | 0.96468750 |
+| Bob 지갑 USDC / 승인 | 70 / 0 | 70 / 0 |
+| Bob 원금 / 미납 이자 | 70 / 3.5 | 0 / 0 |
+| Bob 기록 담보 / 풀 WBTC | 1 / 1 | 0.03531250 / 0.03531250 |
+| 풀 USDC / 가용 현금 | 30 / 30 | 103.5 / 103.5 |
+| 풀 자산 / Alice 권리 | 103.5 / 103.5 | 103.5 / 103.5 |
+
+부채73.5는 담보 가치80의80%인64를 초과하므로 청산 대상이다.
+WBTC 지급량은73.5×1.05÷80=0.96468750이다. 남은0.03531250은 Bob의 권리이며 부채0 뒤 별도 반환할 수 있다.
+보상은 Bob 담보에서 지급한다. 공급자 자산103.5에는 미납 이자3.5가 이미 반영돼 있으므로 수령액이나 이자를 다시 수익으로 더하지 않는다.
+
+[첫 테스트](test/LendingPoolLiquidation.t.sol)의 `test_FullLiquidationUsesLiquidatorFundsAndPreservesSupplierRights`는
+실제 공급·담보 입금·대출·시간 이동으로 준비하고 위 값, 총발행량174 USDC/1 WBTC 유지, 저장 원금·정확 이자·시각을 검증한다.
+풀 성공 로그는 `Liquidated(Charlie,Bob,73_500_000,96_468_750)`1회이며 `Repaid`·`CollateralWithdrawn`은0회다.
+
+### 무엇을 거절하고 어떤 계산을 재사용하나
+
+[청산 진입점](src/LendingPool.sol)은 이미 만든 [부채 장부](src/accounting/DebtLedger.sol)와
+[청산 계산기](src/libraries/LiquidationMath.sol)를 연결한다. 새 부채 장부나 청산 계산식을 복제하지 않는다.
+
+| 판단 | 허용·거절 결과 |
+| --- | --- |
+| 현재 정확 원금+미납 이자 > 정확 담보 가치×80% | 초과할 때만 대상, 정확히80%는 `NotLiquidatable` |
+| 실행 완제액 ≤ 최대 USDC | 등호 허용, 초과하면 `RepaymentLimitExceeded`, 상한0은 `ZeroAmount`, 무부채는 `NoDebt` |
+| 완제액의105%에 필요한 정확 WBTC ≤ 기록 담보 | 부족하면 전체 거절, 지급량을 먼저 내려 부족을 숨기지 않음 |
+| 최종 WBTC 내림값 ≥ 최소 수령량 | 등호·최소0 허용, 최종 지급0은 항상 거절 |
+| 양수 가격·정상 시각·경과3600초 이하 | 한 번의 `latestPrice()` 응답 재사용,0/음수/미래/오래된 가격·원천 오류는 거절 |
+
+검사 순서는 상한0 → 개인 현재 부채/무부채 → 상한 부족 → 가격 → 정확80% → 담보 충분/양수 지급 → 최소 수령량이다.
+그 뒤에만 전역 이자를 저장하고 토큰 이동을 시작한다. 잘못된 요청을 부분 청산으로 바꾸거나 초과 금액을 받지 않는다.
+이자 계산의 `Q=315_360_000_000`은 USDC 표시 자릿수가 아니라 정확 분자를 raw USDC로 바꾸는 분모다.
+대상 판정은 정확 부채 분자를 사용하고, 실제 USDC는 기존 완제 올림값을 받으며 WBTC는 마지막에만 내린다.
+아주 작은 지급은 실제 가치가 낸 USDC보다 작을 수 있으므로 청산자가 최소 WBTC로 제한한다.
+
+### 받은 USDC와 담보 지급을 어떻게 연결하나
+
+사전 검사 뒤의 실제 제품 코드는 다음 순서다.
+
+```solidity
+_accrueInterest();
+_receiveRepayment(msg.sender, borrower, repayment);
+_collateralBalances[borrower] = deposited - collateralOut;
+collateralAsset.safeTransfer(msg.sender, collateralOut);
+emit Liquidated(msg.sender, borrower, repayment, collateralOut);
+```
+
+`_receiveRepayment`가 호출자의 USDC를 받은 뒤 지정 차입자의 미납 이자·원금을 정산한다.
+이미 인식한 이자와 별개로 올려 받은 정산 차이만 공급자 자산에 추가한다. 담보의 실제 지급은 정산이 끝난 뒤다.
+기존 본인 `repay`·`repayAll`은 가격을 조회하지 않는 동작과 `Repaid`1회를 유지한다.
+
+대표 사례에서 USDC가 이동한 직후 콜백에는 **Bob 부채73.5·담보1·자산103.5·현금103.5·가용30**이 보인다.
+부채가 줄기 전에는 들어온 현금을 가용 재원으로 풀지 않는다.
+WBTC 지급 콜백에서는 **Bob 부채0·담보0.03531250·자산103.5·현금/가용103.5**가 보인다.
+토큰 계약이 실행 도중 다시 풀을 호출하는 상황을 콜백 모형으로 관측하며, 두 토큰 주소와 Bob을 구분한다.
+
+USDC 승인/잔고 부족, 실제 이동 뒤 false/revert, 수령 뒤 정산 범위 초과 또는 WBTC 지급 실패는 해당 호출 전체를 되돌린다.
+따라서 WBTC를 못 보냈는데 Charlie의 USDC만 받은 채로 성공하지 않는다.
+토큰·유한 승인·원금/정확 이자·개인/전체 시각·자산·담보와 전파된 콜백 기록이 함께 복구된다.
+별도 거래로 앞서 성공한 승인·공급·담보 입금을 취소한다는 뜻은 아니다.
+
+기존7개와 새 청산은 같은 `nonReentrant` 잠금을 쓴다. 중첩 오류를 토큰이 잡으면 바깥 청산만1회 성공하고,
+전파하면 바깥 청산도 복구된다. 청산 대상이어도 담보가 원리금+5%를 감당하지 못하면 실행하지 않는다.
+그런 포지션의 손실 처리·일부 청산·보상 축소는 후속 범위다. 직접 보낸 USDC/WBTC는 공급 지분·기록 담보를 만들지 않는다.
+
+<details>
+<summary>#29 테스트를 준비 → 실행 → 실제 검증으로 따라 읽기</summary>
+
+새 테스트 함수는 정상15·사전 거절23·전송 실패6·산술/시각4·콜백6의54개다.
+정상 준비는 기존 `InterestTestBase`의 실제 공급100·Bob 담보1을 사용한다.
+실패 준비의 [전용 helper](test/helpers/LiquidationFailureTestBase.sol)는 Bob70과 Dave10의 정상 차입·미저장 반년 이자·Charlie74 유한 승인을 준비하고,
+양 토큰 주소까지 포함한 공개 값과 원시 장부 스냅샷을 구분한다. 원금·이자·자산 주입은 극소/표현 한계에만 사용하며 담보는 실제 입금한다.
+
+#### 정상15개: 토큰과 권리의 실제 전후 값
+
+아래 이름은 [정상 파일](test/LendingPoolLiquidation.t.sol)의 `test_` 뒤 심벌이다. W는 WBTC raw8, USDC 수치는 별도 raw 표시 외에 표시 단위다.
+
+| 테스트 | 준비 → 실행 | 실제 확인 |
+| --- | --- | --- |
+| `FullLiquidationUsesLiquidatorFundsAndPreservesSupplierRights` | 70차입·반년·가격80 → Charlie max74/min0.96 | U73.5·W96_468_750, Charlie.5/승인.5·Bob부채0·담보3_531_250·자산103.5 |
+| `ExactRepaymentCapAndMinimumCollateralAreAllowed` | 이자 없는70·가격80 → max70/min91_875_000 | 등호 허용·정확70만 수령·W91_875_000 |
+| `ZeroMinimumAllowsPositiveCollateralPayment` | 같은70/80 → min0 | 양수 W91_875_000 지급 |
+| `ExactCollateralCoverageUsesOnePriceAtMaximumAge` | 70·가격73.5·갱신3600초 전 → 청산 | 담보1 WBTC 전부 지급, 가격 외부 조회 정확1회 |
+| `ExecutionRecalculatesDebtAndPriceWithinCallersLimits` | 이전70/80 조회 → 반년 뒤 가격85·max74/min0.9 | 실행 U73.5·W90_794_117·잔여9_205_883 |
+| `RemainingCollateralCanBeWithdrawnDuringPriceOutage` | 청산 성공 → 가격 원천 revert 중 Bob 반환 | 잔여8_125_000 전부 반환·USDC 권리 유지·반환 이벤트1회 |
+| `BorrowerCanLiquidateOwnPositionWithoutNetting` | Bob이70 승인 → 자기 청산 | 실제 USDC70 지불·WBTC 수령, 담보/부채 자동 상계 없음 |
+| `SupplierCanLiquidateWithoutSpendingSupplyShares` | Alice 별도 지갑70 → Bob 청산 | 지갑70만 지급·공급 지분/권리100 보존 |
+| `OneAddressCanBeSupplierBorrowerAndLiquidator` | Alice가 세 역할 → 자기 청산 | Alice 지분100·잔여8_125_000, Bob담보1 유지 |
+| `LiquidatorKeepsOwnDebtAndCollateralInMultipleBorrowerPool` | Bob40/Charlie20·반년·가격45 → Charlie가Bob42 완제 | Charlie부채21·옛 개인 저장값/담보1 유지, 전체P20/N1Q·자산103·현금82 |
+| `DirectTokenSurplusDoesNotBecomeSupplyRightsOrBorrowerCollateral` | 직접USDC20/WBTC.25 뒤 청산 | 현금120/가용100·자산100, Bob기록.08125/실WBTC.33125·기부자 권리0 |
+| `FractionalInterestRoundingIsCreditedOnceBeforeSameTimeWithdrawal` | 실제70차입·1초 → 청산 후 같은 시각1raw 출금 | U70_000_001·W91_875_001, 자산100_000_001Q→100_000_000Q·수익 중복 없음 |
+| `PositiveDustCollateralPaymentAllowsExactOneRawMinimum` | 담보2raw·차입1raw·가격55 → max1/min1 | USDC1raw 수령·WBTC1raw 지급·잔여담보1raw |
+| `GlobalCheckpointBeforeLiquidationDoesNotCreditInterestTwice` | 반년 뒤 Alice103.5 추가 공급 → 같은 시각 청산·재조회 | 개인의 늦은 이자 중복 없이 자산/현금207·지분200, 조회는 저장하지 않음 |
+| `PersonalCheckpointBeforeLaterLiquidationPreservesEarlierInterest` | 반년 뒤1상환해 이자2.5 저장 → 1년 시점 청산 | U76·W99_750_000·자산/현금107·Bob지갑69/잔여250_000 |
+
+성공 청산마다 실제 잔고/유한 승인·개인/전체 원금·이자 분자·시각·자산·지분/담보와 정확한 `Liquidated`1회를 확인한다.
+후속 담보 반환·출금은 별도 호출로 구분하고 그 호출의 이벤트를 따로 관측한다.
+
+#### 거절23개·전송 실패6개·산술/시각4개
+
+[실패 파일](test/LendingPoolLiquidationFailure.t.sol)은 세 계약으로 나뉜다.
+
+| 묶음 | 준비 → 실행 | 실제 확인 |
+| --- | --- | --- |
+| 사전 검사 순서 | 상한0/무부채/상한 부족+고장 가격, 건강한 담보+큰min, 담보 부족+큰min | 앞선 정확 오류와 전체 인수, 토큰 미도달·개인/전체 이자/시각 불변 |
+| 정확80%·가격 | 부채70/가격87.5, 가격0/음수·시각0/미래·3601초·원천 revert | 대상 제외 또는 원본 가격 오류, 호출 전 자금·권리/시각 보존 |
+| 기록 담보와 직접 잉여 | Bob70·기록 담보1·가격72에 WBTC.25 직접 송금, Dave담보.5도 풀 보관 → 청산 | 풀에1.75가 있어도 Bob의1만 계산해 담보 부족, 기부자 권리0·기부자/참여자 상태·양 토큰 불변 |
+| 실행 전 변화 |1초 경과 또는 가격81로 변경 → 이전 max/min으로 요청 | 새 U 또는 W로 상한/최소 수령 오류, 부분 이동 없음 |
+| raw 반례5개 | P1/N0/C1/가격125; P1/N1000/C2/가격100; P1/C1/가격100·110; P1/C2/가격55 | 각각 정확80% 제외·올림 견적 오판 방지·내림 전 부족·지급0·min2 거절 |
+| 지급자 자원2개 | Bob 자원은 충분·Charlie 승인 또는 잔고만1raw 부족 → 장애 해제 재시도 | Charlie 기준 ERC20 오류·유한 승인 복구, 재시도만1회 성공 |
+| 실제 전송 뒤 실패4개 | USDC 수령 또는WBTC 지급을 실제 수행한 뒤 false/revert → 해제 재시도 | 실패 토큰 주소의 SafeERC20 오류/원문, 양 토큰·유한 승인·장부·시각·담보 복구 |
+| 표현 한계2개 | 아래 일관된 P2/C1 fixture에서1초/2초 뒤 청산 | 수령 뒤 정산 Panic/수령 전 누적 Panic을 구분·원시값 복구·여유 확보 후 재시도 |
+| 손상 시각2개 | 미래 개인 시각/미래 전체 시각 → 청산 | 개인 snapshot 단계/사전 검사 뒤 전역 갱신 단계의 정확 PastTimestamp, 복구 후 정상 재시도 |
+
+사전 거절은 전송이 실행되면 고유 오류를 내게 해, 다른 실패를 기대 오류로 오인하지 않는다.
+전송 실패는 기존 `FailingMockUSDC/WBTC`가 실제 이동을 먼저 수행한 뒤 실패하므로 단순 false 반환과 다르다.
+실패+재시도는 두 번의 호출이다. Foundry의 정확 호출 횟수도 이 합계2회를 확인한다.
+
+청산용 산술 fixture는 `M=uint256.max`, `Q=315_360_000_000`, `r=M%Q=168_649_639_935`다.
+시작 P2raw·N=r−2000·자산M−2000·현금floor(M/Q)−2·담보1raw·가격315를 맞춘다.
+1초 뒤 정확 부채약2.5347845raw는 담보 가치3.15의80%=2.52를 넘고, U3raw/필요담보1raw라 사전 검사도 통과한다.
+실제 USDC3 수령 뒤 올림 차이Q−r를 자산M에 더할 때만 넘친다. 2초 뒤에는 수령 전 자산 누적부터 넘친다.
+기존 상환의 P1/U2 fixture를 그대로 쓰면 청산 대상과5% 담보 충족을 동시에 통과할 수 없어 이 실패 지점을 검증하지 못한다.
+
+#### 콜백6개: 잠금 밖 정상 대조와 복구
+
+[재진입 파일](test/LendingPoolLiquidationReentrancy.t.sol)의 대표 관측2개는 위 USDC 수령/담보 지급 시점의 고정 값을 확인한다.
+나머지4개는 두 토큰 각각 catch/propagate에서 **기존7개+새 청산8개 요청**을 순회한다.
+토큰 주소 자신의 공급·담보·유한 승인·잔고·필요 부채를 먼저 만들고, 동일 주소/입력으로 잠금 밖 정상 성공 대조를 확인한다.
+중첩 청산에는 별도 Dave의 실제 담보.02·차입1.4를 사용해 원리금1.47·지급.01929375의 실행 가능성을 먼저 확인한다.
+잡으면 바깥 청산만1회, 전파하면 모든 참여자·양 토큰·원시 장부/시각·두 콜백 저장값을 복구하고 해제 후 한 번만 성공한다.
+[전용 mock](test/mocks/LiquidationCallbackMocks.sol)은 실제 전송 뒤 관측·중첩·오류 처리만 담당하며 제품 코드에 시험 분기를 넣지 않는다.
+이는 바깥 청산의 두 콜백을 확인한 범위이며 모든8×8 조합이나 임의 악성 토큰 지원을 보장하지 않는다.
+
+</details>
+
+#29 로컬에서 `forge fmt --check`, `forge build`, 전체 `forge test -vv` **431개 통과/실패0/skip0**, `git diff --check`를 확인했다. 기존377개를 보존하고54개를 추가했다.
+새 원격 CI·PR·병합 결과와 구분하며 게시 전 주요 정상/거절/복구 흐름·설명 자료의 사용자 확인은 별도로 남는다.
+
+## 이전 단계 #28: 돈을 내는 사람과 부채가 줄어드는 사람을 나눈다
 
 청산에서는 Charlie가 USDC를 내고 Bob의 부채가 줄어야 한다.
 이번 [LendingPool](src/LendingPool.sol)은 내부 수령 함수가 **지급자(payer)**와 **차입자(borrower)**를 따로 받도록 바꾼다.
@@ -30,7 +187,7 @@ Solidity·Foundry로 공급·출금부터 작은 단위로 만드는 개인 학�
 | 테스트용 `repayForTest(borrower,amount)` | 호출자 | 지정 차입자 | 없음 |
 
 세 번째 경로는 [시험용 하네스](test/mocks/LendingPoolHarness.sol)에만 있다. 일반 풀의 공개 API에는 대리 상환 함수를 추가하지 않는다.
-실제 청산 함수에서 이 내부 수령 경로를 사용하는 작업은 [#29](https://github.com/0Chord/lending-protocol/issues/29)다.
+이 내부 수령 경로는 위 [#29](https://github.com/0Chord/lending-protocol/issues/29)의 실제 청산에서도 재사용한다.
 
 ### 첫12 USDC는 누구 지갑에서 나가고 누구 부채를 갚나
 
@@ -126,7 +283,7 @@ Charlie의 저장 원금20·미납 분자0·옛 기준 시각도 유지한다. �
 
 [LiquidationMath](src/libraries/LiquidationMath.sol)는 두 질문을 계산한다.
 **“현재 대출은 청산 대상인가?”**, **“전액을 갚으면 WBTC를 얼마나 받을까?”**다.
-실제 청산자의 USDC 수령·부채 정리·WBTC 전송을 풀에 연결하는 작업은 [#29](https://github.com/0Chord/lending-protocol/issues/29)에서 진행한다.
+실제 청산자의 USDC 수령·부채 정리·WBTC 전송은 위 [#29](https://github.com/0Chord/lending-protocol/issues/29) 진입점이 연결한다.
 
 | 입력 | 청산 대상 판정 | 완제액70 USDC의 WBTC 지급 계산 |
 | --- | --- | --- |
@@ -1494,9 +1651,9 @@ assertEq(ShareMath.toSharesUp(1_000_001, 10_000_000, 6_000_000), 600_001);
 
 MockUSDC의 `mint`는 누구나 호출할 수 있는 테스트 준비 기능이다.
 토큰 발행에는 실제 자산 입금이 없으며, 풀의 예치 권리를 만들지 않는다.
-풀은 대출 자산 MockUSDC6·담보 MockWBTC8·Mock 가격 원천8을 배포 때 고정한다. 본인 공급·출금·담보 입금/반환·단리 대출/상환·상한 전액 상환을 다룬다.
-자산 변경·대리 공급/차입/상환·수령자 지정·변동 금리·복리·수수료·청산·잉여 회수·구제 함수는 없다. 가격 하락만으로 부채를 삭제하거나 손실을 보전하지 않는다.
-청산은 순수 계산기만 추가했으며 풀의 자금 이동 기능에는 아직 연결하지 않았다.
+풀은 대출 자산 MockUSDC6·담보 MockWBTC8·Mock 가격 원천8을 배포 때 고정한다. 본인 공급·출금·담보 입금/반환·단리 대출/상환·상한 전액 상환과 전액 청산을 다룬다.
+자산 변경·공개 대리 공급/차입/상환·수령자 지정·변동 금리·복리·수수료·일부 청산·담보 부족 손실 정리·잉여 회수·구제 함수는 없다. 가격 하락만으로 부채를 삭제하거나 손실을 보전하지 않는다.
+청산은 기존 계산기와 내부 상환 경로를 재사용해 USDC 수령·부채 완제·WBTC 지급을 연결한다. 담보가 원리금과5% 보상을 감당하지 못하면 전체 거절한다.
 실제 USDC의 운영 기능, 전송 수수료, 리베이스도 구현하지 않는다. 배포는 이번 작업 범위에 포함하지 않는다.
 
 풀에 직접 전송·발행한 토큰은 예치 권리를 만들지 않는다. 직접 전송 10 후 정상 공급 100이면 풀 현금은 110이고 예치 권리는 100이다.
