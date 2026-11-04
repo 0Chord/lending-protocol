@@ -9,11 +9,12 @@ import {DebtLedger} from "./accounting/DebtLedger.sol";
 import {InterestMath} from "./libraries/InterestMath.sol";
 import {ShareMath} from "./libraries/ShareMath.sol";
 import {CollateralMath} from "./libraries/CollateralMath.sol";
+import {LiquidationMath} from "./libraries/LiquidationMath.sol";
 import {ICollateralPriceSource} from "./interfaces/ICollateralPriceSource.sol";
 
-/// @title WBTC 담보 대출의 단리 이자를 공급자 권리에 반영하는 학습 풀
+/// @title WBTC 담보 대출의 단리 이자와 전액 청산을 연결하는 학습 풀
 /// @notice 공급 지분·WBTC 담보·USDC 부채를 분리하고 정상 공급분의 현금만 지급한다.
-/// @dev 고정6/8/8 Mock 자산·가격과 연10% 단리의 로컬 학습 단계이며 청산·실제 오라클은 제외한다.
+/// @dev 고정6/8/8 Mock 자산·가격의 로컬 학습 단계이며 담보 부족 손실 처리·실제 오라클은 제외한다.
 contract LendingPool is ReentrancyGuard {
     using SafeERC20 for IERC20;
     using DebtLedger for DebtLedger.State;
@@ -53,6 +54,15 @@ contract LendingPool is ReentrancyGuard {
     /// @notice 실제 수령한 본인 USDC 상환액을 이자와 원금의 합으로 알린다.
     event Repaid(address indexed user, uint256 amount);
 
+    /// @notice 청산자의 실제 USDC 완제액과 차입자 담보에서 지급한 WBTC 수량을 알린다.
+    event Liquidated(address indexed liquidator, address indexed borrower, uint256 repaid, uint256 collateralOut);
+
+    /// @notice 현재 정확 부채가 담보 가치의80%를 초과하지 않으면 청산할 수 없다.
+    error NotLiquidatable(address borrower);
+
+    /// @notice 최종 WBTC 지급량이 청산자의 최소 수령량보다 작으면 전체 거절한다.
+    error InsufficientCollateralOut(uint256 actual, uint256 minimum);
+
     /// @notice 본인 부채보다 많은 상환은 일부 수령 없이 거절한다.
     error RepayExceedsDebt(uint256 debt, uint256 requested);
 
@@ -71,7 +81,7 @@ contract LendingPool is ReentrancyGuard {
     /// @notice 총부채가 인정자산보다 큰 손상 장부를 현금 부족으로 숨기지 않는다.
     error InvalidDebtAccounting(uint256 accountedAssets, uint256 totalDebt);
 
-    /// @notice 일곱 자금 이동 진입점 모두 0 요청을 유효한 동작으로 취급하지 않는다.
+    /// @notice 여덟 자금 이동 진입점 모두 0 요청·지급 상한을 유효한 동작으로 취급하지 않는다.
     error ZeroAmount();
 
     /// @notice 양수 공급으로 지분을 받지 못하면 토큰을 받지 않고 거절한다.
@@ -230,6 +240,33 @@ contract LendingPool is ReentrancyGuard {
         _accrueInterest();
         _receiveRepayment(msg.sender, msg.sender, debt);
         emit Repaid(msg.sender, debt);
+    }
+
+    /// @notice 위험 부채를 호출자 USDC로 완제하고5% 보상 포함 WBTC를 호출자에게 지급한다.
+    /// @dev 정확80%는 제외하며 담보 부족·전송·정산 실패는 이자·승인·양 토큰·담보를 모두 복구한다.
+    /// @param borrower 부채와 기록 담보를 정리할 차입자이며 호출자 본인도 허용한다.
+    /// @param maxRepayAmount 실제 완제액에 허용할 USDC 최소 단위 상한
+    /// @param minCollateralOut 최종 내림 지급량에 요구할 WBTC 최소 단위 하한
+    function liquidate(address borrower, uint256 maxRepayAmount, uint256 minCollateralOut) external nonReentrant {
+        if (maxRepayAmount == 0) revert ZeroAmount();
+        DebtLedger.Snapshot memory current = _debtLedger.borrowerSnapshot(borrower, block.timestamp);
+        uint256 repayment = InterestMath.quoteDebt(current.principal, current.interestNumerator);
+        if (repayment == 0) revert NoDebt();
+        if (repayment > maxRepayAmount) revert RepaymentLimitExceeded(repayment, maxRepayAmount);
+
+        (int256 price, uint256 updatedAt) = priceSource.latestPrice();
+        uint256 deposited = _collateralBalances[borrower];
+        if (!LiquidationMath.isLiquidatable(current.debtNumerator, deposited, price, updatedAt, block.timestamp)) {
+            revert NotLiquidatable(borrower);
+        }
+        uint256 collateralOut = LiquidationMath.collateralOut(repayment, deposited, price, updatedAt, block.timestamp);
+        if (collateralOut < minCollateralOut) revert InsufficientCollateralOut(collateralOut, minCollateralOut);
+
+        _accrueInterest();
+        _receiveRepayment(msg.sender, borrower, repayment);
+        _collateralBalances[borrower] = deposited - collateralOut;
+        collateralAsset.safeTransfer(msg.sender, collateralOut);
+        emit Liquidated(msg.sender, borrower, repayment, collateralOut);
     }
 
     /// @notice 본인 지분의 USDC 가치를 최소 단위에서 내려 반환한다.
